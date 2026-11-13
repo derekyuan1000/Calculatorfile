@@ -120,7 +120,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13v"
+VERSION = "2026.11.13w"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -2276,6 +2276,7 @@ def autofocus(cam, w, h):
     global AF_NOTE, FOCUS_POS
     t0 = time.ticks_ms()
     try:
+        rtc_stage("focus: talking to the camera chip")
         i2c = _af_i2c()
         if (_rd(i2c, 0x300A), _rd(i2c, 0x300B)) != (0x56, 0x40):
             AF_NOTE = "not an OV5640"
@@ -2285,6 +2286,7 @@ def autofocus(cam, w, h):
         def score(pos):
             if pos in scores:
                 return scores[pos]
+            rtc_stage("focus: lens %d" % pos)
             _lens(i2c, pos)
             time.sleep_ms(30)          # let the lens settle
             cam.capture()              # this frame may have started before the move
@@ -2394,11 +2396,18 @@ def _raw_photo():
         cam = None
         try:
             snap_stage("camera on (%s): start, focus or capture" % name)
+            rtc_stage("camera start " + name)
             cam = Camera(pixel_format=PixelFormat.GRAYSCALE, frame_size=size)
             time.sleep_ms(300)
-            if CAM_AF:
+            global AF_SKIP
+            if CAM_AF and not AF_SKIP:
+                rtc_stage("first frame")
                 cam.capture()         # get frames flowing
                 print("autofocus:", autofocus(cam, w, h))
+            elif AF_SKIP:
+                AF_SKIP = False
+                print("autofocus skipped (it crashed last time)")
+            rtc_stage("capture")
             raw = None
             for i in range(8):        # the first frames can be dark or missing
                 img = cam.capture()
@@ -2412,11 +2421,13 @@ def _raw_photo():
         except Exception as e:
             last = "%s: %s" % (name, e)
         finally:
+            rtc_stage("camera off")
             try:
                 if cam is not None:
                     cam.deinit()
             except Exception:
                 pass
+            rtc_stage(None)
             snap_stage("camera standby")
             camera_standby()
             if FOCUS_POS != start_pos and FOCUS_POS >= 0:
@@ -2448,15 +2459,43 @@ def snap_stage(name):
         pass
 
 
+def rtc_stage(name):
+    """Finer photo steps while the camera runs: kept in RTC memory (RAM that
+    survives a crash restart), because flash must not be touched then."""
+    try:
+        d = _rtc_get()
+        if name is None:
+            d.pop("snap", None)
+        else:
+            d["snap"] = name
+        _rtc_put(d)
+    except Exception:
+        pass
+
+
+AF_SKIP = False       # the last photo crashed while focusing: try one without
+
+
 def check_snap_crash():
     """At boot: did the last photo restart us? Remember it for GET_SNAP/Test."""
-    global SNAP_CRASH
+    global SNAP_CRASH, AF_SKIP
     try:
         with open("snap.stage") as f:
             stage = f.read().strip()
     except OSError:
+        rtc_stage(None)
         return
     snap_stage(None)
+    fine = ""
+    try:
+        fine = _rtc_get().get("snap", "")
+    except Exception:
+        pass
+    rtc_stage(None)
+    if fine:
+        stage = fine
+    if "focus" in stage:
+        AF_SKIP = True
     try:
         cause = machine.reset_cause()
     except Exception:
@@ -2487,7 +2526,8 @@ def take_snapshot():
     if SNAP_CRASH:                 # the last try restarted the XIAO: say where
         why = SNAP_CRASH
         SNAP_CRASH = ""
-        return "ERR:The camera restarted the XIAO~" + why + "~Send this to Claude. F6 tries again."
+        return "ERR:The camera restarted the XIAO~" + why + "~Send this to Claude. F6 tries again" + \
+            (" without autofocus." if AF_SKIP else ".")
     bt = PHONE is not None
     if bt:
         phone_stop()
