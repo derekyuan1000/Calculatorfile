@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.14g"
+VERSION = "2026.11.14h"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -2021,7 +2021,7 @@ def _chip_sharpen():
 def _tune_sensor(cam):
     """Let the camera chip do the clean-up in hardware: a bit more contrast
     and sharpness for text. Ignored on firmware without these settings."""
-    for prop, val in (("contrast", 2), ("brightness", 1)):
+    for prop, val in (("contrast", 1), ("brightness", 0)):
         try:
             setattr(cam, prop, val)
         except Exception:
@@ -2120,6 +2120,9 @@ def autofocus(cam, w, h):
             best = max(scores, key=lambda k: scores[k])
         score(best - 60)
         score(best + 60)
+        best = max(scores, key=lambda k: scores[k])
+        score(best - 30)               # finer: the sharp zone is narrow up close
+        score(best + 30)
         best = max(scores, key=lambda k: scores[k])
         _lens(i2c, best)
         time.sleep_ms(30)
