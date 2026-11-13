@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.12"
+VERSION = "2026.11.13c"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1617,10 +1617,18 @@ try:
     import jpeg
 except ImportError:
     Camera = None
+CAP_S = 0.0
 LAST_SNAP = None          # JPEG bytes of the last photo
 SNAP_W, SNAP_H = 256, 192  # preview size, drawn 1:1 on the calculator
 PHOTO_DEFAULT = "Solve the question in this photo. Show full working."
 PHOTO_SIZES = (("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480))
+DEBUG_PHOTOS = True       # TEMPORARY: upload each photo (processed + raw) to catbox.moe and
+                          # show the links under the answer. Set False when done testing.
+DOC_ENHANCE = True        # clean up photos for reading: even light, crisp text
+DOC_CELL = 32             # lighting is measured in 32x32 pixel cells
+DOC_PROMPT = ("This is a photo of a page, board or screen. First read ALL the text exactly, "
+              "including maths, and describe every diagram: shapes, labels, axes, arrows, values, "
+              "units. Then answer the request. If something is unreadable say which part. Request: ")
 PHOTO_MIRROR = True       # this camera's picture is mirrored left-to-right
 
 
@@ -1677,6 +1685,204 @@ def _pack4(grey: ptr8, out: ptr8, n: int, lo: int, span: int):
         k += 2
 
 
+@micropython.viper
+def _cells(raw: ptr8, w: int, h: int, cell: int, grid: ptr8, gw: int, gh: int):
+    """Mean brightness of each cell (16 samples), i.e. a tiny copy of the photo."""
+    st = cell >> 2
+    cy = 0
+    while cy < gh:
+        cx = 0
+        while cx < gw:
+            tot = 0
+            j = 0
+            while j < 4:
+                y = cy * cell + j * st + (st >> 1)
+                if y >= h:
+                    y = h - 1
+                i = 0
+                while i < 4:
+                    x = cx * cell + i * st + (st >> 1)
+                    if x >= w:
+                        x = w - 1
+                    tot += raw[y * w + x]
+                    i += 1
+                j += 1
+            grid[cy * gw + cx] = tot >> 4
+            cx += 1
+        cy += 1
+
+
+@micropython.viper
+def _paper(grid: ptr8, gw: int, gh: int, out: ptr8):
+    """Paper brightness per cell: the lightest of the 3x3 cells around it (ink
+    is dark, so the lightest neighbour is the paper, not the writing)."""
+    y = 0
+    while y < gh:
+        x = 0
+        while x < gw:
+            m = 0
+            dy = -1
+            while dy < 2:
+                yy = y + dy
+                if yy >= 0 and yy < gh:
+                    dx = -1
+                    while dx < 2:
+                        xx = x + dx
+                        if xx >= 0 and xx < gw:
+                            v = grid[yy * gw + xx]
+                            if v > m:
+                                m = v
+                        dx += 1
+                dy += 1
+            if m < 40:
+                m = 40
+            out[y * gw + x] = m
+            x += 1
+        y += 1
+
+
+@micropython.viper
+def _flatten(raw: ptr8, w: int, h: int, cell: int, paper: ptr8, gw: int, gh: int,
+             rowbg: ptr8, white: int):
+    """Divide out uneven lighting: paper -> white, ink stays dark. Paper
+    brightness is blended smoothly between cell centres (stepped, not
+    recomputed per pixel)."""
+    half = cell >> 1
+    y = 0
+    while y < h:
+        gy = y - half
+        if gy < 0:
+            gy = 0
+        iy = gy // cell
+        fy = ((gy - iy * cell) * 256) // cell
+        if iy >= gh - 1:
+            iy = gh - 1
+            fy = 0
+        i = 0
+        while i < gw:
+            a = int(paper[iy * gw + i])
+            b = a
+            if fy > 0:
+                b = int(paper[(iy + 1) * gw + i])
+            rowbg[i] = (a * (256 - fy) + b * fy) >> 8
+            i += 1
+        base = y * w
+        x = 0
+        seg = 0                    # segment s runs from centre of cell s-1 to cell s
+        while x < w:
+            # bg0 at the segment start, bg1 at its end, in 1/256 units
+            c0 = seg - 1
+            c1 = seg
+            if c0 < 0:
+                c0 = 0
+            if c1 > gw - 1:
+                c1 = gw - 1
+            g0 = int(rowbg[c0]) << 8
+            g1 = int(rowbg[c1]) << 8
+            xs = seg * cell - half
+            if xs < 0:
+                xs = 0
+            xe = xs + cell
+            if seg == 0:
+                xe = half
+            if xe > w:
+                xe = w
+            n = xe - xs
+            if n < 1:
+                n = 1
+            step = (g1 - g0) // n
+            bg = g0
+            if seg == 0:
+                step = 0
+            xx = xs
+            while xx < xe:
+                b8 = bg >> 8
+                if b8 < 1:
+                    b8 = 1
+                v = raw[base + xx] * white // b8
+                if v > 255:
+                    v = 255
+                raw[base + xx] = v
+                bg += step
+                xx += 1
+            x = xe
+            seg += 1
+        y += 1
+
+
+@micropython.viper
+def _sharpen(src: ptr8, dst: ptr8, w: int, h: int, d: int, amt: int):
+    """Unsharp mask: out = v + amt/8 * (4v - four neighbours d pixels away).
+    Border rows/columns are copied unchanged."""
+    n = w * h
+    i = 0
+    while i < n:
+        dst[i] = src[i]
+        i += 1
+    dw = d * w
+    y = d
+    while y < h - d:
+        p = y * w + d
+        e = y * w + w - d
+        while p < e:
+            v = int(src[p])
+            t = v + (amt * (4 * v - int(src[p - d]) - int(src[p + d]) - int(src[p - dw]) - int(src[p + dw]))) // 8
+            if t < 0:
+                t = 0
+            if t > 255:
+                t = 255
+            dst[p] = t
+            p += 1
+        y += 1
+
+
+@micropython.viper
+def _apply_lut(buf: ptr8, n: int, lut: ptr8):
+    i = 0
+    while i < n:
+        buf[i] = lut[buf[i]]
+        i += 1
+
+
+def enhance_page(raw, w, h):
+    """Make a photo of a page easier to read (for people and for the AI):
+    1. even out the light (shadows, glare gradients), paper -> white
+    2. sharpen edges (mild focus blur, thin pen strokes)
+    3. stretch contrast so ink is properly black
+    Returns the new buffer (raw is reused/freed by the caller)."""
+    t0 = time.ticks_ms()
+    gw = (w + DOC_CELL - 1) // DOC_CELL
+    gh = (h + DOC_CELL - 1) // DOC_CELL
+    grid = bytearray(gw * gh)
+    paper = bytearray(gw * gh)
+    _cells(raw, w, h, DOC_CELL, grid, gw, gh)
+    _paper(grid, gw, gh, paper)
+    _flatten(raw, w, h, DOC_CELL, paper, gw, gh, bytearray(gw + 1), 238)
+    out = bytearray(w * h)
+    _sharpen(raw, out, w, h, 2, 6)
+    # contrast: darkest 1% -> black, paper stays white; a little extra bite
+    hist = [0] * 256
+    for k in range(0, w * h, 7):
+        hist[out[k]] += 1
+    n = sum(hist)
+    acc = 0
+    lo = 0
+    for v in range(256):
+        acc += hist[v]
+        if acc >= n // 100:
+            lo = v
+            break
+    hi = 235
+    span = max(40, hi - lo)
+    lut = bytearray(256)
+    for v in range(256):
+        t = (v - lo) * 255 // span
+        lut[v] = 0 if t < 0 else (255 if t > 255 else t)
+    _apply_lut(out, w * h, lut)
+    print("enhance %d ms" % time.ticks_diff(time.ticks_ms(), t0))
+    return out
+
+
 def _raw_photo():
     """(width, height, greyscale bytes) at the largest size that works. The
     camera is switched off again afterwards: left running it draws power."""
@@ -1720,14 +1926,31 @@ def take_snapshot():
         return "ERR:No camera support~Flash the camera firmware (mpy_cam XIAO_ESP32S3)."
     set_cpu(FAST_HZ)
     t0 = time.ticks_ms()
+    global CAP_S
     try:
         w, h, raw = _raw_photo()
+        CAP_S = time.ticks_diff(time.ticks_ms(), t0) / 1000
     except Exception as e:
         return "ERR:Camera failed~" + str(e)[:90] + "~Is the camera board clicked on fully?"
     # This camera's image comes out mirrored left-to-right: flip each row
     # (otherwise text reads backwards, for you and for the AI).
     if PHOTO_MIRROR:
         _mirror_rows(raw, w, h)
+    if DEBUG_PHOTOS:
+        try:
+            jr = jpeg.Encoder(width=w, height=h, pixel_format="GRAY", quality=82).encode(raw)
+            with open("last_raw.jpg", "wb") as f:
+                f.write(jr)
+            del jr
+        except Exception as e:
+            print("raw save failed:", e)
+    if DOC_ENHANCE:
+        try:
+            raw = enhance_page(raw, w, h)
+            gc.collect()
+        except Exception as e:      # out of memory etc: send the plain photo
+            print("enhance failed:", e)
+            gc.collect()
     # preview: average 4 samples per preview pixel, then stretch the contrast
     # (darkest 2% -> black, brightest 2% -> white) into 16 grey levels
     grey = bytearray(SNAP_W * SNAP_H)
@@ -1739,7 +1962,7 @@ def take_snapshot():
     _pack4(grey, out, SNAP_W * SNAP_H, lo, max(1, hi - lo))
     del grey
     try:
-        jpg = jpeg.Encoder(width=w, height=h, pixel_format="GRAY", quality=85).encode(raw)
+        jpg = jpeg.Encoder(width=w, height=h, pixel_format="GRAY", quality=82).encode(raw)
     except Exception as e:
         return "ERR:Could not compress the photo~" + str(e)[:80]
     del raw
@@ -1750,8 +1973,8 @@ def take_snapshot():
             f.write(jpg)
     except OSError:
         pass
-    print("photo: %dx%d, %d KB, %.1fs" % (w, h, len(jpg) // 1024,
-                                        time.ticks_diff(time.ticks_ms(), t0) / 1000))
+    print("photo: %dx%d, %d KB, %.1fs (capture %.1fs)" % (w, h, len(jpg) // 1024,
+                                        time.ticks_diff(time.ticks_ms(), t0) / 1000, CAP_S))
     return b"SNAP:%dx%d:" % (SNAP_W, SNAP_H) + binascii.b2a_base64(out).strip()
 
 
@@ -1776,11 +1999,52 @@ def last_photo():
     return LAST_SNAP
 
 
+def upload_photo(path):
+    """Debug: anonymous upload to catbox.moe; returns the https link or ''."""
+    try:
+        import urequests
+        with open(path, "rb") as f:
+            data = f.read()
+        b = "----gi" + str(time.ticks_ms())
+        head = ('--%s\r\nContent-Disposition: form-data; name="reqtype"\r\n\r\nfileupload\r\n'
+                '--%s\r\nContent-Disposition: form-data; name="fileToUpload"; filename="%s"\r\n'
+                'Content-Type: image/jpeg\r\n\r\n') % (b, b, path)
+        body = head.encode() + data + ("\r\n--%s--\r\n" % b).encode()
+        del data
+        gc.collect()
+        r = urequests.post("https://catbox.moe/user/api.php", data=body,
+                           headers={"Content-Type": "multipart/form-data; boundary=" + b,
+                                    "User-Agent": "G-Intelligence"})
+        try:
+            t = r.text.strip()
+            return t if t.startswith("https://") else ""
+        finally:
+            r.close()
+    except Exception as e:
+        print("upload failed:", e)
+        return ""
+    finally:
+        gc.collect()
+
+
+def debug_links():
+    if not DEBUG_PHOTOS:
+        return ""
+    a = upload_photo("last_photo.jpg")
+    b = upload_photo("last_raw.jpg")
+    out = ""
+    if a:
+        out += "\n\n[debug] processed: " + a
+    if b:
+        out += "\n[debug] raw: " + b
+    return out or "\n\n[debug] upload failed"
+
+
 def ask_snapshot(question):
     """GET_ASKSNAP: ask about the last photo; plain text reply like a question."""
     if last_photo() is None:
         return "error: Take a photo first (F6)."
-    q = question or PHOTO_DEFAULT
+    q = (DOC_PROMPT if DOC_ENHANCE else "") + (question or PHOTO_DEFAULT)
     deadline = time.ticks_add(time.ticks_ms(), PHOTO_BUDGET * 1000)
     why = ready_to_ask()
     if why:
@@ -1804,7 +2068,7 @@ def ask_snapshot(question):
             text, why = reply_text(resp)
             if not text:
                 return "error: " + why
-            reply = encode_reply(text)
+            reply = encode_reply(text + debug_links())
             remember_turn("[photo] " + q, reply.replace("~", "\n"))
             return reply
         except OSError as e:
