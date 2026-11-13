@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13e"
+VERSION = "2026.11.13g"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1865,9 +1865,9 @@ def enhance_page(raw, w, h):
     mid = sorted(grid)[len(grid) // 2]
     if mid >= 110:
         _paper(grid, gw, gh, paper)
-        _flatten(raw, w, h, DOC_CELL, paper, gw, gh, bytearray(gw + 1), 238)
+        _flatten(raw, w, h, DOC_CELL, paper, gw, gh, bytearray(gw + 1), 228)
     out = bytearray(w * h)
-    _sharpen(raw, out, w, h, 1, 4)
+    _sharpen(raw, out, w, h, 1, 3)
     # contrast: darkest 1% -> black, paper stays white; a little extra bite
     hist = [0] * 256
     for k in range(0, w * h, 7):
@@ -1880,7 +1880,7 @@ def enhance_page(raw, w, h):
         if acc >= n // 100:
             lo = v
             break
-    hi = 235 if mid >= 110 else 250
+    hi = 244 if mid >= 110 else 250   # paper -> white, light greys kept
     span = max(40, hi - lo)
     lut = bytearray(256)
     for v in range(256):
@@ -2016,11 +2016,12 @@ def autofocus():
             return AF_NOTE
         _wr(i2c, 0x3023, 0x01)
         _wr(i2c, 0x3022, 0x03)                    # single autofocus
-        for _ in range(150):                      # up to 1.5 s
-            if _rd(i2c, 0x3023) == 0:
+        st = 0
+        for _ in range(60):                       # status 0x10 = focused; up to 3 s
+            time.sleep_ms(50)
+            st = _rd(i2c, 0x3029)
+            if st == 0x10:
                 break
-            time.sleep_ms(10)
-        st = _rd(i2c, 0x3029)
         AF_NOTE = ("focused" if st == 0x10 else "focus status %02x" % st) + \
             " in %.1fs" % (time.ticks_diff(time.ticks_ms(), t0) / 1000)
     except Exception as e:
