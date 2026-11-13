@@ -120,7 +120,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13u"
+VERSION = "2026.11.13v"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -2293,14 +2293,10 @@ def autofocus(cam, w, h):
             scores[pos] = sc
             return sc
 
-        # start where the last photo was focused (saved, survives sleep),
-        # else a coarse sweep; then climb towards the sharper side
-        last = -1
-        try:
-            with open("focus.txt") as f:
-                last = int(f.read())
-        except Exception:
-            pass
+        # start where the last photo was focused (read from focus.txt by
+        # _raw_photo before the camera started), else a coarse sweep; then
+        # climb towards the sharper side
+        last = FOCUS_POS
         if 0 <= last <= 1023:
             for pos in (last - 150, last, last + 150):
                 score(max(0, min(1023, pos)))
@@ -2324,12 +2320,7 @@ def autofocus(cam, w, h):
         best = max(scores, key=lambda k: scores[k])
         _lens(i2c, best)
         time.sleep_ms(30)
-        FOCUS_POS = best
-        try:
-            with open("focus.txt", "w") as f:
-                f.write(str(best))
-        except Exception:
-            pass
+        FOCUS_POS = best               # saved to focus.txt once the camera is off
         lo = min(scores.values())
         AF_NOTE = "lens %d, contrast x%.1f, %d tries, %.1fs" % (
             best, scores[best] / max(1, lo), len(scores), time.ticks_diff(time.ticks_ms(), t0) / 1000)
@@ -2384,6 +2375,17 @@ def straighten(src, w, h, dst=None):
 def _raw_photo():
     """(width, height, greyscale bytes) at the largest size that works. The
     camera is switched off again afterwards: left running it draws power."""
+    # NEVER touch flash (files) while the camera is running: a flash access
+    # pauses the memory cache that the camera's DMA is writing through, and
+    # the ESP32-S3 crashes ("hard reset" during autofocus). So focus.txt is
+    # read before the camera starts and written after it stops.
+    global FOCUS_POS
+    try:
+        with open("focus.txt") as f:
+            FOCUS_POS = int(f.read())
+    except Exception:
+        FOCUS_POS = -1
+    start_pos = FOCUS_POS
     last = ""
     for name, w, h in PHOTO_SIZES:
         size = getattr(FrameSize, name, None)
@@ -2391,15 +2393,12 @@ def _raw_photo():
             continue
         cam = None
         try:
-            snap_stage("camera start " + name)
+            snap_stage("camera on (%s): start, focus or capture" % name)
             cam = Camera(pixel_format=PixelFormat.GRAYSCALE, frame_size=size)
             time.sleep_ms(300)
             if CAM_AF:
-                snap_stage("first frame")
                 cam.capture()         # get frames flowing
-                snap_stage("autofocus")
                 print("autofocus:", autofocus(cam, w, h))
-            snap_stage("capture")
             raw = None
             for i in range(8):        # the first frames can be dark or missing
                 img = cam.capture()
@@ -2413,7 +2412,6 @@ def _raw_photo():
         except Exception as e:
             last = "%s: %s" % (name, e)
         finally:
-            snap_stage("camera off")
             try:
                 if cam is not None:
                     cam.deinit()
@@ -2421,6 +2419,13 @@ def _raw_photo():
                 pass
             snap_stage("camera standby")
             camera_standby()
+            if FOCUS_POS != start_pos and FOCUS_POS >= 0:
+                try:
+                    with open("focus.txt", "w") as f:
+                        f.write(str(FOCUS_POS))
+                except Exception:
+                    pass
+                start_pos = FOCUS_POS
             gc.collect()
         print("camera", last)
     raise OSError(last)
@@ -2458,7 +2463,14 @@ def check_snap_crash():
         cause = -1
     names = {1: "power on / brownout", 2: "hard reset", 3: "watchdog", 4: "deep sleep",
              5: "soft reset"}
-    SNAP_CRASH = "during: %s~reset cause: %s (%d)" % (stage, names.get(cause, "crash"), cause)
+    why = names.get(cause, "crash")
+    try:
+        r = machine.mem32[0x60008038] & 0x3F   # RTC_CNTL_RESET_STATE_REG, CPU0 reason
+        why += {0x0F: ": brownout (battery low?)", 0x0C: ": crash (CPU reset)",
+                0x10: ": watchdog", 0x07: ": watchdog"}.get(r, ": code 0x%02x" % r)
+    except Exception:
+        pass
+    SNAP_CRASH = "during: %s~reset cause: %s (%d)" % (stage, why, cause)
     try:
         with open("crash.txt") as f:
             last = [l.strip() for l in f.read().split("\n") if l.strip()][-2:]
