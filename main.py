@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.14e"
+VERSION = "2026.11.14g"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1936,7 +1936,7 @@ LAST_SNAP = None          # JPEG bytes of the last photo
 SNAP_W, SNAP_H = 256, 192  # preview size, drawn 1:1 on the calculator
 PHOTO_DEFAULT = "Solve the question in this photo. Show full working."
 PHOTO_SIZES = (("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480))
-DEBUG_PHOTOS = True       # TEMPORARY testing aid: upload each photo (processed + raw) to catbox.moe and
+DEBUG_PHOTOS = True       # TEMPORARY: show the focus result under photo answers: upload each photo (processed + raw) to catbox.moe and
                           # show the links under the answer. Set False when done testing.
 CAM_AF = True             # autofocus: search for the sharpest lens position before each photo
 DOC_ENHANCE = True        # tell the AI it's reading a page (see DOC_PROMPT)
@@ -2021,7 +2021,6 @@ def _chip_sharpen():
 def _tune_sensor(cam):
     """Let the camera chip do the clean-up in hardware: a bit more contrast
     and sharpness for text. Ignored on firmware without these settings."""
-    _chip_sharpen()
     for prop, val in (("contrast", 2), ("brightness", 1)):
         try:
             setattr(cam, prop, val)
@@ -2161,6 +2160,9 @@ def _raw_photo():
             if CAM_AF:
                 cam.capture()         # get frames flowing
                 print("autofocus:", autofocus(cam, w, h))
+            # sharpening only now: switched on during focusing it amplifies
+            # grain so every lens position looks equally "sharp"
+            _chip_sharpen()
             raw = None
             for i in range(8):        # the first frames can be dark or missing
                 img = cam.capture()
@@ -2292,16 +2294,12 @@ def upload_photo(path):
 
 
 def debug_links():
+    """While testing: show the focus result under photo answers. (Photo
+    uploads are gone: the free host stopped accepting them. In phone mode
+    the GI Link app now shows the photo instead.)"""
     if not DEBUG_PHOTOS:
         return ""
-    a = upload_photo("last_photo.jpg")
-    b = ""                 # no separate raw copy any more (the chip does the clean-up)
-    out = "\n\n[debug] focus: " + (AF_NOTE or "off")
-    if a:
-        out += "\n[debug] processed: " + a
-    if b:
-        out += "\n[debug] raw: " + b
-    return out if (a or b) else out + "\n[debug] upload failed"
+    return "\n\n[debug] focus: " + (AF_NOTE or "off")
 
 
 def ask_snapshot(question):
