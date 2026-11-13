@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13d"
+VERSION = "2026.11.13e"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1624,6 +1624,10 @@ PHOTO_DEFAULT = "Solve the question in this photo. Show full working."
 PHOTO_SIZES = (("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480))
 DEBUG_PHOTOS = True       # TEMPORARY: upload each photo (processed + raw) to catbox.moe and
                           # show the links under the answer. Set False when done testing.
+CAM_AF = True             # autofocus: load the OV5640's focus firmware and focus before
+                          # each photo (without it the lens sits at its far-away rest point)
+PHOTO_ROTATE = 21         # degrees: straighten the picture (camera sits tilted in the case);
+                          # + turns the picture anticlockwise, 0 = off
 DOC_ENHANCE = True        # clean up photos for reading: even light, crisp text
 DOC_CELL = 32             # lighting is measured in 32x32 pixel cells
 DOC_PROMPT = ("This is a photo of a page, board or screen. First read ALL the text exactly, "
@@ -1887,6 +1891,186 @@ def enhance_page(raw, w, h):
     return out
 
 
+# OV5640 autofocus firmware (4077 bytes, from github.com/0015/ESP32-OV5640-AF,
+# public domain / MIT). The chip forgets it on every reset, so it is loaded
+# each time the camera starts: about 0.2 s, then ~1 s to focus.
+AF_FW = (
+    "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"
+)
+AF_NOTE = ""              # last autofocus result, shown in debug output
+
+
+def _af_i2c():
+    from machine import SoftI2C
+    return SoftI2C(scl=Pin(39), sda=Pin(40), freq=400000)
+
+
+def _rd(i2c, reg):
+    return i2c.readfrom_mem(0x3C, reg, 1, addrsize=16)[0]
+
+
+def _wr(i2c, reg, val):
+    i2c.writeto_mem(0x3C, reg, bytes((val,)), addrsize=16)
+
+
+def autofocus():
+    """Load the focus firmware into the camera chip and focus once on the
+    middle of the picture. Returns a short status; never raises."""
+    global AF_NOTE
+    t0 = time.ticks_ms()
+    try:
+        i2c = _af_i2c()
+        if (_rd(i2c, 0x300A), _rd(i2c, 0x300B)) != (0x56, 0x40):
+            AF_NOTE = "not an OV5640"
+            return AF_NOTE
+        fw = binascii.a2b_base64("".join(AF_FW))
+        _wr(i2c, 0x3000, 0x20)                    # hold the focus MCU in reset
+        for k in range(0, len(fw), 128):          # burst writes, address auto-increments
+            i2c.writeto_mem(0x3C, 0x8000 + k, fw[k:k + 128], addrsize=16)
+        if i2c.readfrom_mem(0x3C, 0x8000, 16, addrsize=16) != fw[:16] or \
+                i2c.readfrom_mem(0x3C, 0x8000 + len(fw) - 16, 16, addrsize=16) != fw[-16:]:
+            for k in range(len(fw)):              # chip didn't take bursts: byte by byte
+                _wr(i2c, 0x8000 + k, fw[k])
+        del fw
+        for reg in range(0x3022, 0x3029):
+            _wr(i2c, reg, 0)
+        _wr(i2c, 0x3029, 0x7F)
+        _wr(i2c, 0x3000, 0x00)                    # start the focus MCU
+        for _ in range(200):                      # wait for "idle" (firmware running)
+            if _rd(i2c, 0x3029) == 0x70:
+                break
+            time.sleep_ms(5)
+        else:
+            AF_NOTE = "firmware didn't start (%02x)" % _rd(i2c, 0x3029)
+            return AF_NOTE
+        _wr(i2c, 0x3023, 0x01)
+        _wr(i2c, 0x3022, 0x03)                    # single autofocus
+        for _ in range(150):                      # up to 1.5 s
+            if _rd(i2c, 0x3023) == 0:
+                break
+            time.sleep_ms(10)
+        st = _rd(i2c, 0x3029)
+        AF_NOTE = ("focused" if st == 0x10 else "focus status %02x" % st) + \
+            " in %.1fs" % (time.ticks_diff(time.ticks_ms(), t0) / 1000)
+    except Exception as e:
+        AF_NOTE = "failed: " + str(e)[:40]
+    return AF_NOTE
+
+
+@micropython.viper
+def _rotate(src: ptr8, dst: ptr8, w: int, h: int, c16: int, s16: int, fill: int):
+    """dst = src turned anticlockwise (c16, s16 = cos, sin x 65536), smooth
+    (bilinear) so text edges stay clean; corners outside the photo = fill."""
+    cx = w << 15            # centre, 16.16 fixed point
+    cy = h << 15
+    y = 0
+    while y < h:
+        # offsets from the centre in half pixels keep every product inside
+        # 32 bits (viper ints wrap): 65536 x 2048 at most
+        hx = 1 - w
+        hy = 2 * y + 1 - h
+        sx = ((c16 * hx - s16 * hy) >> 1) + cx - 32768
+        sy = ((s16 * hx + c16 * hy) >> 1) + cy - 32768
+        o = y * w
+        x = 0
+        while x < w:
+            ix = sx >> 16
+            iy = sy >> 16
+            if ix >= 0 and iy >= 0 and ix < w - 1 and iy < h - 1:
+                fx = (sx >> 8) & 255
+                fy = (sy >> 8) & 255
+                p = iy * w + ix
+                a = int(src[p]) * (256 - fx) + int(src[p + 1]) * fx
+                b = int(src[p + w]) * (256 - fx) + int(src[p + w + 1]) * fx
+                dst[o + x] = (a * (256 - fy) + b * fy) >> 16
+            else:
+                dst[o + x] = fill
+            sx += c16
+            sy += s16
+            x += 1
+        y += 1
+
+
+def straighten(src, w, h, dst=None):
+    """Turn the photo by PHOTO_ROTATE degrees. Returns the turned buffer."""
+    if dst is None:
+        dst = bytearray(w * h)
+    a = math.radians(PHOTO_ROTATE)
+    _rotate(src, dst, w, h, int(math.cos(a) * 65536), int(math.sin(a) * 65536), 255)
+    return dst
+
+
 def _raw_photo():
     """(width, height, greyscale bytes) at the largest size that works. The
     camera is switched off again afterwards: left running it draws power."""
@@ -1899,6 +2083,9 @@ def _raw_photo():
         try:
             cam = Camera(pixel_format=PixelFormat.GRAYSCALE, frame_size=size)
             time.sleep_ms(300)
+            if CAM_AF:
+                cam.capture()         # get frames flowing: focusing needs them
+                print("autofocus:", autofocus())
             raw = None
             for i in range(8):        # the first frames can be dark or missing
                 img = cam.capture()
@@ -1954,6 +2141,13 @@ def take_snapshot():
             gc.collect()
         except Exception as e:      # out of memory etc: send the plain photo
             print("enhance failed:", e)
+            gc.collect()
+    if PHOTO_ROTATE:
+        try:
+            raw = straighten(raw, w, h)
+            gc.collect()
+        except Exception as e:
+            print("rotate failed:", e)
             gc.collect()
     # preview: average 4 samples per preview pixel, then stretch the contrast
     # (darkest 2% -> black, brightest 2% -> white) into 16 grey levels
@@ -2036,12 +2230,12 @@ def debug_links():
         return ""
     a = upload_photo("last_photo.jpg")
     b = upload_photo("last_raw.jpg")
-    out = ""
+    out = "\n\n[debug] focus: " + (AF_NOTE or "off")
     if a:
-        out += "\n\n[debug] processed: " + a
+        out += "\n[debug] processed: " + a
     if b:
         out += "\n[debug] raw: " + b
-    return out or "\n\n[debug] upload failed"
+    return out if (a or b) else out + "\n[debug] upload failed"
 
 
 def ask_snapshot(question):
