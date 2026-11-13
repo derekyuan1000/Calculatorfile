@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13y"
+VERSION = "2026.11.13z"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -2407,6 +2407,20 @@ def straighten(src, w, h, dst=None):
     return dst
 
 
+def _open_camera(size):
+    """One frame buffer, filled only when we ask (WHEN_EMPTY), instead of the
+    default two buffers the camera keeps overwriting in the background. The
+    background writing was crashing the XIAO depending on where other things
+    sat in memory. Older camera firmware without these options: defaults."""
+    try:
+        from camera import GrabMode
+        return Camera(pixel_format=PixelFormat.GRAYSCALE, frame_size=size,
+                      fb_count=1, grab_mode=GrabMode.WHEN_EMPTY)
+    except (ImportError, TypeError, AttributeError) as e:
+        print("camera: default buffers (%s)" % e)
+        return Camera(pixel_format=PixelFormat.GRAYSCALE, frame_size=size)
+
+
 def _raw_photo():
     """(width, height, greyscale bytes) at the largest size that works. The
     camera is switched off again afterwards: left running it draws power."""
@@ -2417,7 +2431,7 @@ def _raw_photo():
             continue
         cam = None
         try:
-            cam = Camera(pixel_format=PixelFormat.GRAYSCALE, frame_size=size)
+            cam = _open_camera(size)
             time.sleep_ms(300)
             if CAM_AF:
                 cam.capture()         # get frames flowing: focusing needs them
