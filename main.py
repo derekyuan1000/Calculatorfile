@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.14h"
+VERSION = "2026.11.14i"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1936,7 +1936,7 @@ LAST_SNAP = None          # JPEG bytes of the last photo
 SNAP_W, SNAP_H = 256, 192  # preview size, drawn 1:1 on the calculator
 PHOTO_DEFAULT = "Solve the question in this photo. Show full working."
 PHOTO_SIZES = (("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480))
-DEBUG_PHOTOS = True       # TEMPORARY: show the focus result under photo answers: upload each photo (processed + raw) to catbox.moe and
+DEBUG_PHOTOS = False      # True: show the focus result under photo answers: upload each photo (processed + raw) to catbox.moe and
                           # show the links under the answer. Set False when done testing.
 CAM_AF = True             # autofocus: search for the sharpest lens position before each photo
 DOC_ENHANCE = True        # tell the AI it's reading a page (see DOC_PROMPT)
