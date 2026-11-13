@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13i"
+VERSION = "2026.11.13k"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1622,7 +1622,7 @@ LAST_SNAP = None          # JPEG bytes of the last photo
 SNAP_W, SNAP_H = 256, 192  # preview size, drawn 1:1 on the calculator
 PHOTO_DEFAULT = "Solve the question in this photo. Show full working."
 PHOTO_SIZES = (("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480))
-DEBUG_PHOTOS = True       # TEMPORARY: upload each photo (processed + raw) to catbox.moe and
+DEBUG_PHOTOS = False      # testing aid: upload each photo (processed + raw) to catbox.moe and
                           # show the links under the answer. Set False when done testing.
 CAM_AF = True             # autofocus: sweep the lens and keep the sharpest position
                           # (without it the lens sits at its far-away rest point)
@@ -1848,6 +1848,28 @@ def _apply_lut(buf: ptr8, n: int, lut: ptr8):
         i += 1
 
 
+@micropython.viper
+def _dark_pct(buf: ptr8, n: int, step: int, frac: int) -> int:
+    """Grey level below which 1/frac of the (sampled) pixels lie."""
+    hist = bytearray(1024)
+    h32 = ptr32(hist)
+    k = 0
+    cnt = 0
+    while k < n:
+        h32[buf[k]] += 1
+        cnt += 1
+        k += step
+    need = cnt // frac
+    acc = 0
+    v = 0
+    while v < 256:
+        acc += h32[v]
+        if acc >= need:
+            return v
+        v += 1
+    return 255
+
+
 def enhance_page(raw, w, h):
     """Make a photo of a page easier to read (for people and for the AI):
     1. even out the light (shadows, glare gradients), paper -> white
@@ -1869,17 +1891,7 @@ def enhance_page(raw, w, h):
     out = bytearray(w * h)
     _sharpen(raw, out, w, h, 1, 3)
     # contrast: darkest 1% -> black, paper stays white; a little extra bite
-    hist = [0] * 256
-    for k in range(0, w * h, 7):
-        hist[out[k]] += 1
-    n = sum(hist)
-    acc = 0
-    lo = 0
-    for v in range(256):
-        acc += hist[v]
-        if acc >= n // 100:
-            lo = v
-            break
+    lo = _dark_pct(out, w * h, 7, 100)     # 1% darkest level (fast, viper)
     hi = 244 if mid >= 110 else 250   # paper -> white, light greys kept
     span = max(40, hi - lo)
     lut = bytearray(256)
@@ -1895,8 +1907,8 @@ def enhance_page(raw, w, h):
 # focus firmware loads but never finishes a search on this board, so the
 # lens is moved directly (its VCM driver: a 10-bit position, 0 = far away,
 # higher = closer) and the sharpest of a quick sweep is kept:
-#   coarse: 9 positions 0..1000, then fine: 3 around the best.
-# About 2 s. CAM_AF = False skips it (lens rests at far away).
+#   starts at the last photo's position (focus.txt), climbs to the sharpest,
+#   then checks either side. About 5-8 frames pairs. CAM_AF = False skips it (lens rests at far away).
 AF_NOTE = ""              # last autofocus result, shown in debug output
 FOCUS_POS = -1            # last good lens position (tried first next time)
 
@@ -1957,24 +1969,53 @@ def autofocus(cam, w, h):
             if pos in scores:
                 return scores[pos]
             _lens(i2c, pos)
-            time.sleep_ms(40)          # let the lens settle
+            time.sleep_ms(30)          # let the lens settle
             cam.capture()              # this frame may have started before the move
             img = cam.capture()
             sc = _sharpness(img, w, h) if img is not None and len(img) >= w * h else 0
             scores[pos] = sc
             return sc
 
-        best = max(range(0, 1001, 125), key=score)
-        for pos in (best - 60, best + 60, best - 30, best + 30):
+        # start where the last photo was focused (saved, survives sleep),
+        # else a coarse sweep; then climb towards the sharper side
+        last = -1
+        try:
+            with open("focus.txt") as f:
+                last = int(f.read())
+        except Exception:
+            pass
+        if 0 <= last <= 1023:
+            for pos in (last - 150, last, last + 150):
+                score(max(0, min(1023, pos)))
+        else:
+            for pos in (0, 200, 400, 600, 800, 1000):
+                score(pos)
+        for _ in range(6):
+            best = max(scores, key=lambda k: scores[k])
+            nxt = None
+            if best == max(scores) and best < 1023:
+                nxt = min(1023, best + 150)
+            elif best == min(scores) and best > 0:
+                nxt = max(0, best - 150)
+            if nxt is None or nxt in scores:
+                break
+            score(nxt)
+        best = max(scores, key=lambda k: scores[k])
+        for pos in (best - 60, best + 60):
             if 0 <= pos <= 1023:
                 score(pos)
         best = max(scores, key=lambda k: scores[k])
         _lens(i2c, best)
-        time.sleep_ms(40)
+        time.sleep_ms(30)
         FOCUS_POS = best
+        try:
+            with open("focus.txt", "w") as f:
+                f.write(str(best))
+        except Exception:
+            pass
         lo = min(scores.values())
-        AF_NOTE = "lens %d, contrast x%.1f, %.1fs" % (
-            best, scores[best] / max(1, lo), time.ticks_diff(time.ticks_ms(), t0) / 1000)
+        AF_NOTE = "lens %d, contrast x%.1f, %d tries, %.1fs" % (
+            best, scores[best] / max(1, lo), len(scores), time.ticks_diff(time.ticks_ms(), t0) / 1000)
     except Exception as e:
         AF_NOTE = "failed: " + str(e)[:40]
     return AF_NOTE
@@ -2041,7 +2082,7 @@ def _raw_photo():
             raw = None
             for i in range(8):        # the first frames can be dark or missing
                 img = cam.capture()
-                if img is not None and len(img) >= w * h and i >= 2:
+                if img is not None and len(img) >= w * h and i >= (1 if CAM_AF else 2):
                     raw = bytearray(img)
                     break
                 time.sleep_ms(100)
