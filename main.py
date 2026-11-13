@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.14c"
+VERSION = "2026.11.14d"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1936,7 +1936,7 @@ LAST_SNAP = None          # JPEG bytes of the last photo
 SNAP_W, SNAP_H = 256, 192  # preview size, drawn 1:1 on the calculator
 PHOTO_DEFAULT = "Solve the question in this photo. Show full working."
 PHOTO_SIZES = (("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480))
-DEBUG_PHOTOS = False      # testing aid: upload each photo (processed + raw) to catbox.moe and
+DEBUG_PHOTOS = True       # TEMPORARY testing aid: upload each photo (processed + raw) to catbox.moe and
                           # show the links under the answer. Set False when done testing.
 CAM_AF = True             # autofocus: search for the sharpest lens position before each photo
 DOC_ENHANCE = True        # tell the AI it's reading a page (see DOC_PROMPT)
@@ -2002,10 +2002,27 @@ def _hw_mirror():
         return False
 
 
+CHIP_SHARPEN = 0x18       # OV5640 manual sharpening strength (0 off .. 0x20 max)
+
+
+def _chip_sharpen():
+    """Sharpen text in the camera chip (replaces the software sharpening
+    that needed compiled code). OV5640 registers 0x5308/0x5302."""
+    try:
+        i2c = _af_i2c()
+        if (_rd(i2c, 0x300A), _rd(i2c, 0x300B)) != (0x56, 0x40):
+            return
+        _wr(i2c, 0x5308, (_rd(i2c, 0x5308) & ~0x40 & 0xFF) | 0x40)   # manual sharpness
+        _wr(i2c, 0x5302, CHIP_SHARPEN)
+    except Exception as e:
+        print("chip sharpen failed:", e)
+
+
 def _tune_sensor(cam):
     """Let the camera chip do the clean-up in hardware: a bit more contrast
     and sharpness for text. Ignored on firmware without these settings."""
-    for prop, val in (("contrast", 2), ("sharpness", 2), ("brightness", 1)):
+    _chip_sharpen()
+    for prop, val in (("contrast", 2), ("brightness", 1)):
         try:
             setattr(cam, prop, val)
         except Exception:
@@ -2271,7 +2288,7 @@ def debug_links():
     if not DEBUG_PHOTOS:
         return ""
     a = upload_photo("last_photo.jpg")
-    b = upload_photo("last_raw.jpg")
+    b = ""                 # no separate raw copy any more (the chip does the clean-up)
     out = "\n\n[debug] focus: " + (AF_NOTE or "off")
     if a:
         out += "\n[debug] processed: " + a
