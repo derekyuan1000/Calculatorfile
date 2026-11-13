@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13r"
+VERSION = "2026.11.13s"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -899,7 +899,10 @@ class PhoneLink:
         return self.connected()
 
     def send(self, data):
-        n = max(20, self.mtu - 3)
+        # one notification = at most MTU-3 bytes, and never more than 500:
+        # Bluetooth caps a value at 512 and longer pieces get cut short
+        # (the phone then waits for bytes that never come)
+        n = max(20, min(self.mtu - 3, 500))
         mv = memoryview(data)
         k = 0
         tries = 0
