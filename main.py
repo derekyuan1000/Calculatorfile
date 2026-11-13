@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13g"
+VERSION = "2026.11.13h"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1984,7 +1984,7 @@ def _wr(i2c, reg, val):
     i2c.writeto_mem(0x3C, reg, bytes((val,)), addrsize=16)
 
 
-def autofocus():
+def autofocus(cam=None):
     """Load the focus firmware into the camera chip and focus once on the
     middle of the picture. Returns a short status; never raises."""
     global AF_NOTE
@@ -2014,11 +2014,30 @@ def autofocus():
         else:
             AF_NOTE = "firmware didn't start (%02x)" % _rd(i2c, 0x3029)
             return AF_NOTE
+        # same sequence as the Arduino library that works on this board:
+        # reset the focus state, then continuous autofocus
+        _wr(i2c, 0x3022, 0x01)
+        _wr(i2c, 0x3022, 0x08)
+        for _ in range(100):
+            if _rd(i2c, 0x3023) == 0:
+                break
+            time.sleep_ms(5)
         _wr(i2c, 0x3023, 0x01)
-        _wr(i2c, 0x3022, 0x03)                    # single autofocus
+        _wr(i2c, 0x3022, 0x04)                    # continuous autofocus
+        for _ in range(100):
+            if _rd(i2c, 0x3023) == 0:
+                break
+            time.sleep_ms(5)
         st = 0
-        for _ in range(60):                       # status 0x10 = focused; up to 3 s
-            time.sleep_ms(50)
+        t1 = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), t1) < 3000:
+            if cam is not None:                   # keep frames flowing: the focus
+                try:                              # search measures each frame
+                    cam.capture()
+                except Exception:
+                    time.sleep_ms(30)
+            else:
+                time.sleep_ms(50)
             st = _rd(i2c, 0x3029)
             if st == 0x10:
                 break
@@ -2086,7 +2105,7 @@ def _raw_photo():
             time.sleep_ms(300)
             if CAM_AF:
                 cam.capture()         # get frames flowing: focusing needs them
-                print("autofocus:", autofocus())
+                print("autofocus:", autofocus(cam))
             raw = None
             for i in range(8):        # the first frames can be dark or missing
                 img = cam.capture()
