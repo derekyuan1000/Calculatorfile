@@ -120,7 +120,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13w-oldcam"
+VERSION = "2026.11.13w-noble"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -811,10 +811,7 @@ def remember_turn(question, answer):
 #   phone -> XIAO:  {"i":id,"s":status,"n":len,"h":{headers}}\n + len bytes
 #                or {"i":id,"e":"what went wrong"}\n
 # Settings > Connection on the calculator picks Auto / WiFi only / Phone only.
-try:
-    import bluetooth
-except ImportError:
-    bluetooth = None
+bluetooth = None   # TEST BUILD: Bluetooth code removed
 PHONE_NAME = "GI-calc"
 PHONE_WAIT_S = 8           # how long to wait for the app to (re)connect
 _NUS = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -822,159 +819,7 @@ _NUS_RX = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"   # phone writes here
 _NUS_TX = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"   # we notify here
 
 
-class PhoneLink:
-    def __init__(self):
-        self.ble = bluetooth.BLE()
-        self.ble.active(True)
-        try:
-            self.ble.config(gap_name=PHONE_NAME, mtu=517)
-        except Exception:
-            pass
-        self.ble.irq(self._irq)
-        rx = (bluetooth.UUID(_NUS_RX), bluetooth.FLAG_WRITE | bluetooth.FLAG_WRITE_NO_RESPONSE)
-        tx = (bluetooth.UUID(_NUS_TX), bluetooth.FLAG_NOTIFY | bluetooth.FLAG_READ)
-        ((self.tx, self.rx),) = self.ble.gatts_register_services(((bluetooth.UUID(_NUS), (tx, rx)),))
-        self.ble.gatts_set_buffer(self.rx, 8192, True)   # room for several 512-byte writes
-        self.conn = None
-        self.ready = False               # app subscribed and said hello
-        self.mtu = 23
-        self.inbuf = bytearray()
-        self.started = time.ticks_ms()
-        self.next_id = 1
-        self.advertise()
-
-    def advertise(self):
-        # flags + the service UUID (so the app finds us); name in the scan response
-        u = bytes(reversed(binascii.unhexlify(_NUS.replace("-", ""))))
-        adv = b"\x02\x01\x06" + bytes((len(u) + 1, 0x07)) + u
-        name = PHONE_NAME.encode()
-        resp = bytes((len(name) + 1, 0x09)) + name
-        try:
-            self.ble.gap_advertise(100000, adv_data=adv, resp_data=resp)
-        except Exception as e:
-            print("phone: advertise failed", e)
-
-    def _irq(self, event, data):
-        if event == 1:                     # phone connected (not ready until hello)
-            self.conn = data[0]
-            self.ready = False
-            self.inbuf = bytearray()
-        elif event == 2:                   # phone disconnected
-            self.conn = None
-            self.ready = False
-            self.mtu = 23
-            print("phone: disconnected")
-            self.advertise()
-        elif event == 3:                   # phone wrote data
-            if data[1] == self.rx:
-                self._pull()
-        elif event == 21:                  # MTU agreed
-            self.mtu = data[1]
-
-    def _pull(self):
-        """Take whatever the phone has written so far. The write events can
-        be dropped when they come in fast (MicroPython's event queue is
-        small) but the data waits in the buffer, so this is also polled."""
-        if self.conn is None:
-            return
-        try:
-            more = self.ble.gatts_read(self.rx)
-        except Exception:
-            return
-        if more:
-            self.inbuf += more
-        if not self.ready and b"hello" in bytes(self.inbuf[:64]):
-            # the app has turned on notifications: safe to send now
-            self.ready = True
-            self.inbuf = bytearray()
-            print("phone: connected")
-
-    def connected(self):
-        return self.conn is not None and self.ready
-
-    def wait(self, secs):
-        end = time.ticks_add(time.ticks_ms(), int(secs * 1000))
-        while not self.connected() and time.ticks_diff(end, time.ticks_ms()) > 0:
-            time.sleep_ms(50)
-            self._pull()
-        return self.connected()
-
-    def send(self, data):
-        # one notification = at most MTU-3 bytes, and never more than 500:
-        # Bluetooth caps a value at 512 and longer pieces get cut short
-        # (the phone then waits for bytes that never come)
-        n = max(20, min(self.mtu - 3, 500))
-        mv = memoryview(data)
-        k = 0
-        tries = 0
-        while k < len(data):
-            if self.conn is None:
-                raise OSError(128, "phone disconnected")
-            try:
-                self.ble.gatts_notify(self.conn, self.tx, mv[k:k + n])
-                k += n
-                tries = 0
-                time.sleep_ms(2)         # don't outrun the radio: dropped pieces = no answer
-            except OSError:
-                tries += 1               # send queue full: give it a moment
-                if tries > 400:
-                    raise OSError(110, "phone not reading")
-                time.sleep_ms(5)
-
-    def request(self, method, url, headers, body, timeout):
-        """One web request through the phone. Returns (status, headers, body bytes)."""
-        if not self.connected():
-            raise OSError(128, "phone not connected")
-        rid = self.next_id
-        self.next_id += 1
-        body = body or b""
-        if isinstance(body, str):
-            body = body.encode()
-        head = json.dumps({"i": rid, "m": method, "u": url, "h": headers or {},
-                           "n": len(body), "t": int(timeout)})
-        self._pull()
-        self.inbuf = bytearray()
-        self.send(head.encode() + b"\n")
-        if body:
-            self.send(body)
-        del body
-        gc.collect()
-        end = time.ticks_add(time.ticks_ms(), int((timeout + 10) * 1000))
-        hdr = None
-        skip = 0                         # body bytes of a stale answer to drop
-        while True:
-            if self.conn is None:
-                raise OSError(128, "phone disconnected")
-            if time.ticks_diff(end, time.ticks_ms()) < 0:
-                raise OSError(110, "phone timed out")
-            self._pull()
-            if skip:
-                if len(self.inbuf) < skip:
-                    time.sleep_ms(10)
-                    continue
-                self.inbuf = self.inbuf[skip:]
-                skip = 0
-            if hdr is None:
-                j = bytes(self.inbuf[:1024]).find(b"\n")   # bytearray has no find()
-                if j >= 0:
-                    try:
-                        hdr = json.loads(bytes(self.inbuf[:j]))
-                    except ValueError:
-                        hdr = {}
-                    self.inbuf = self.inbuf[j + 1:]
-                    if hdr.get("i") != rid:
-                        skip = int(hdr.get("n", 0))   # stale answer to an older request
-                        hdr = None
-                        continue
-                    if "e" in hdr:
-                        raise OSError(-1, "phone: " + str(hdr["e"])[:40])
-            if hdr is not None and len(self.inbuf) >= int(hdr.get("n", 0)):
-                n = int(hdr.get("n", 0))
-                data = bytes(self.inbuf[:n])
-                self.inbuf = self.inbuf[n:]
-                return int(hdr.get("s", 0)), hdr.get("h") or {}, data
-            time.sleep_ms(5)
-
+PhoneLink = None   # TEST BUILD: removed
 
 PHONE = None
 
@@ -1231,6 +1076,28 @@ def ask_ai(prompt, tries=3):
     return "error: " + last
 
 
+def mem_note():
+    """Free memory: Python heap, the chip's internal RAM (camera DMA, WiFi
+    and Bluetooth live there) and PSRAM. For tracking down camera crashes."""
+    gc.collect()
+    try:
+        out = "RAM py %dK" % (gc.mem_free() // 1024)
+    except Exception:
+        out = "RAM ?"
+    try:
+        import esp32
+        internal = esp32.idf_heap_info(esp32.HEAP_DATA)
+        big = [r for r in internal if r[0] > 1000000]
+        small = [r for r in internal if r[0] <= 1000000]
+        out += ", int %dK (blk %dK)" % (sum(r[1] for r in small) // 1024,
+                                        max([r[2] for r in small] or [0]) // 1024)
+        if big:
+            out += ", psram %dK" % (sum(r[1] for r in big) // 1024)
+    except Exception as e:
+        out += " (%s)" % str(e)[:20]
+    return out
+
+
 def run_test():
     """WiFi (or phone) -> DNS -> a tiny real API call. Lines joined with ~."""
     global ROUTE
@@ -1252,7 +1119,7 @@ def run_test():
         return "ERR:" + "~".join(lines + ["Server: " + describe_status(code)])
     if not wlan.isconnected():
         return "ERR:WiFi: not connected~Check SSID and password, then use the WiFi row."
-    lines = ["main.py " + VERSION]
+    lines = ["main.py " + VERSION, mem_note()]
     if SNAP_CRASH:
         lines.append("Last photo crashed " + SNAP_CRASH.replace("~", ", ")[:90])
     try:
