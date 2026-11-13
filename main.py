@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.14a"
+VERSION = "2026.11.14b"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1936,355 +1936,72 @@ LAST_SNAP = None          # JPEG bytes of the last photo
 SNAP_W, SNAP_H = 256, 192  # preview size, drawn 1:1 on the calculator
 PHOTO_DEFAULT = "Solve the question in this photo. Show full working."
 PHOTO_SIZES = (("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480))
-SAVE_RAW = True           # keep last_raw.jpg (the unprocessed photo); the working
-                          # version always did this and photos crash without it
 DEBUG_PHOTOS = False      # testing aid: upload each photo (processed + raw) to catbox.moe and
                           # show the links under the answer. Set False when done testing.
-CAM_AF = True             # autofocus: load the OV5640's focus firmware and focus before
-                          # each photo (without it the lens sits at its far-away rest point)
-PHOTO_ROTATE = 21         # degrees: straighten the picture (camera sits tilted in the case);
-                          # + turns the picture anticlockwise, 0 = off
-DOC_ENHANCE = True        # clean up photos for reading: even light, crisp text
-DOC_CELL = 32             # lighting is measured in 32x32 pixel cells
+CAM_AF = True             # autofocus: search for the sharpest lens position before each photo
+DOC_ENHANCE = True        # tell the AI it's reading a page (see DOC_PROMPT)
 DOC_PROMPT = ("This is a photo of a page, board or screen. First read ALL the text exactly, "
               "including maths, and describe every diagram: shapes, labels, axes, arrows, values, "
               "units. Then answer the request. If something is unreadable say which part. Request: ")
 PHOTO_MIRROR = True       # this camera's picture is mirrored left-to-right
 
 
-@micropython.viper
-def _mirror_rows(buf: ptr8, w: int, h: int):
-    """Reverse every row in place (the camera's picture is mirrored)."""
-    r = 0
-    while r < h:
+
+# No @micropython.viper / native code anywhere: on this board, once main.py
+# grew past a certain size, calling ANY compiled-to-machine-code function
+# crashed the XIAO instantly (that was the "camera" crash). Everything here
+# uses plain Python and MicroPython's built-in (C) operations instead.
+
+def _mirror(raw, w, h):
+    """Flip each row left-to-right (the camera's picture is mirrored)."""
+    for r in range(h):
         i = r * w
-        j = i + w - 1
-        while i < j:
-            t = buf[i]
-            buf[i] = buf[j]
-            buf[j] = t
-            i += 1
-            j -= 1
-        r += 1
+        raw[i:i + w] = bytes(reversed(raw[i:i + w]))
 
 
-@micropython.viper
-def _preview(raw: ptr8, w: int, sx: int, sy: int, out: ptr8, ow: int, oh: int):
-    """Shrink the photo: each preview pixel = mean of 4 samples in its cell."""
-    hx = sx // 2
-    hy = (sy // 2) * w
+def _preview4(raw, w, h):
+    """256x192 preview, 4-bit greys packed two to a byte, contrast stretched
+    (darkest 2% black, brightest 2% white)."""
+    sx = w // SNAP_W
+    sy = h // SNAP_H
+    grey = bytearray(SNAP_W * SNAP_H)
     k = 0
-    y = 0
-    while y < oh:
-        r0 = y * sy * w
-        x = 0
-        while x < ow:
-            c = r0 + x * sx
-            out[k] = (raw[c] + raw[c + hx] + raw[c + hy] + raw[c + hy + hx]) >> 2
+    for y in range(SNAP_H):
+        base = (y * sy + sy // 2) * w + sx // 2
+        for x in range(SNAP_W):
+            grey[k] = raw[base + x * sx]
             k += 1
-            x += 1
-        y += 1
-
-
-@micropython.viper
-def _pack4(grey: ptr8, out: ptr8, n: int, lo: int, span: int):
-    """Stretch lo..lo+span to 0..15 and pack two pixels a byte."""
-    k = 0
-    while k < n:
-        a = (grey[k] - lo) * 15 // span
-        b = (grey[k + 1] - lo) * 15 // span
-        if a < 0:
-            a = 0
-        if a > 15:
-            a = 15
-        if b < 0:
-            b = 0
-        if b > 15:
-            b = 15
-        out[k >> 1] = (a << 4) | b
-        k += 2
-
-
-@micropython.viper
-def _cells(raw: ptr8, w: int, h: int, cell: int, grid: ptr8, gw: int, gh: int):
-    """Mean brightness of each cell (16 samples), i.e. a tiny copy of the photo."""
-    st = cell >> 2
-    cy = 0
-    while cy < gh:
-        cx = 0
-        while cx < gw:
-            tot = 0
-            j = 0
-            while j < 4:
-                y = cy * cell + j * st + (st >> 1)
-                if y >= h:
-                    y = h - 1
-                i = 0
-                while i < 4:
-                    x = cx * cell + i * st + (st >> 1)
-                    if x >= w:
-                        x = w - 1
-                    tot += raw[y * w + x]
-                    i += 1
-                j += 1
-            grid[cy * gw + cx] = tot >> 4
-            cx += 1
-        cy += 1
-
-
-@micropython.viper
-def _paper(grid: ptr8, gw: int, gh: int, out: ptr8):
-    """Paper brightness per cell: the lightest of the 3x3 cells around it (ink
-    is dark, so the lightest neighbour is the paper, not the writing)."""
-    y = 0
-    while y < gh:
-        x = 0
-        while x < gw:
-            m = 0
-            dy = -1
-            while dy < 2:
-                yy = y + dy
-                if yy >= 0 and yy < gh:
-                    dx = -1
-                    while dx < 2:
-                        xx = x + dx
-                        if xx >= 0 and xx < gw:
-                            v = grid[yy * gw + xx]
-                            if v > m:
-                                m = v
-                        dx += 1
-                dy += 1
-            if m < 140:         # at most ~1.7x lift: pages, not screens
-                m = 140
-            out[y * gw + x] = m
-            x += 1
-        y += 1
-
-
-@micropython.viper
-def _flatten(raw: ptr8, w: int, h: int, cell: int, paper: ptr8, gw: int, gh: int,
-             rowbg: ptr8, white: int):
-    """Divide out uneven lighting: paper -> white, ink stays dark. Paper
-    brightness is blended smoothly between cell centres (stepped, not
-    recomputed per pixel)."""
-    half = cell >> 1
-    y = 0
-    while y < h:
-        gy = y - half
-        if gy < 0:
-            gy = 0
-        iy = gy // cell
-        fy = ((gy - iy * cell) * 256) // cell
-        if iy >= gh - 1:
-            iy = gh - 1
-            fy = 0
-        i = 0
-        while i < gw:
-            a = int(paper[iy * gw + i])
-            b = a
-            if fy > 0:
-                b = int(paper[(iy + 1) * gw + i])
-            rowbg[i] = (a * (256 - fy) + b * fy) >> 8
-            i += 1
-        base = y * w
-        x = 0
-        seg = 0                    # segment s runs from centre of cell s-1 to cell s
-        while x < w:
-            # bg0 at the segment start, bg1 at its end, in 1/256 units
-            c0 = seg - 1
-            c1 = seg
-            if c0 < 0:
-                c0 = 0
-            if c1 > gw - 1:
-                c1 = gw - 1
-            g0 = int(rowbg[c0]) << 8
-            g1 = int(rowbg[c1]) << 8
-            xs = seg * cell - half
-            if xs < 0:
-                xs = 0
-            xe = xs + cell
-            if seg == 0:
-                xe = half
-            if xe > w:
-                xe = w
-            n = xe - xs
-            if n < 1:
-                n = 1
-            step = (g1 - g0) // n
-            bg = g0
-            if seg == 0:
-                step = 0
-            xx = xs
-            while xx < xe:
-                b8 = bg >> 8
-                if b8 < 1:
-                    b8 = 1
-                v = raw[base + xx] * white // b8
-                if v > 255:
-                    v = 255
-                raw[base + xx] = v
-                bg += step
-                xx += 1
-            x = xe
-            seg += 1
-        y += 1
-
-
-@micropython.viper
-def _sharpen(src: ptr8, dst: ptr8, w: int, h: int, d: int, amt: int):
-    """Unsharp mask: out = v + amt/8 * (4v - four neighbours d pixels away).
-    Border rows/columns are copied unchanged."""
-    n = w * h
-    i = 0
-    while i < n:
-        dst[i] = src[i]
-        i += 1
-    dw = d * w
-    y = d
-    while y < h - d:
-        p = y * w + d
-        e = y * w + w - d
-        while p < e:
-            v = int(src[p])
-            t = v + (amt * (4 * v - int(src[p - d]) - int(src[p + d]) - int(src[p - dw]) - int(src[p + dw]))) // 8
-            if t < 0:
-                t = 0
-            if t > 255:
-                t = 255
-            dst[p] = t
-            p += 1
-        y += 1
-
-
-@micropython.viper
-def _apply_lut(buf: ptr8, n: int, lut: ptr8):
-    i = 0
-    while i < n:
-        buf[i] = lut[buf[i]]
-        i += 1
-
-
-def enhance_page(raw, w, h):
-    """Make a photo of a page easier to read (for people and for the AI):
-    1. even out the light (shadows, glare gradients), paper -> white
-    2. sharpen edges (mild focus blur, thin pen strokes)
-    3. stretch contrast so ink is properly black
-    Returns the new buffer (raw is reused/freed by the caller)."""
-    t0 = time.ticks_ms()
-    gw = (w + DOC_CELL - 1) // DOC_CELL
-    gh = (h + DOC_CELL - 1) // DOC_CELL
-    grid = bytearray(gw * gh)
-    paper = bytearray(gw * gh)
-    _cells(raw, w, h, DOC_CELL, grid, gw, gh)
-    # lighting fix only for pages (mostly light). Dark scenes and screens
-    # have no "paper", dividing by the bright surroundings blows them out.
-    mid = sorted(grid)[len(grid) // 2]
-    if mid >= 110:
-        _paper(grid, gw, gh, paper)
-        _flatten(raw, w, h, DOC_CELL, paper, gw, gh, bytearray(gw + 1), 228)
-    out = bytearray(w * h)
-    _sharpen(raw, out, w, h, 1, 3)
-    # contrast: darkest 1% -> black, paper stays white; a little extra bite
-    hist = [0] * 256
-    for k in range(0, w * h, 7):
-        hist[out[k]] += 1
-    n = sum(hist)
-    acc = 0
-    lo = 0
-    for v in range(256):
-        acc += hist[v]
-        if acc >= n // 100:
-            lo = v
-            break
-    hi = 244 if mid >= 110 else 250   # paper -> white, light greys kept
-    span = max(40, hi - lo)
+    srt = sorted(grey[k] for k in range(0, len(grey), 11))
+    lo = srt[len(srt) // 50]
+    span = max(1, srt[-1 - len(srt) // 50] - lo)
     lut = bytearray(256)
     for v in range(256):
-        t = (v - lo) * 255 // span
-        lut[v] = 0 if t < 0 else (255 if t > 255 else t)
-    _apply_lut(out, w * h, lut)
-    print("enhance %d ms" % time.ticks_diff(time.ticks_ms(), t0))
+        t = (v - lo) * 15 // span
+        lut[v] = 0 if t < 0 else (15 if t > 15 else t)
+    out = bytearray(SNAP_W * SNAP_H // 2)
+    for j in range(0, SNAP_W * SNAP_H, 2):
+        out[j >> 1] = (lut[grey[j]] << 4) | lut[grey[j + 1]]
     return out
 
 
-# OV5640 autofocus firmware (4077 bytes, from github.com/0015/ESP32-OV5640-AF,
-# public domain / MIT). The chip forgets it on every reset, so it is loaded
-# each time the camera starts: about 0.2 s, then ~1 s to focus.
-AF_FW = (
-    "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"
-)
-AF_NOTE = ""              # last autofocus result, shown in debug output
+def _tune_sensor(cam):
+    """Let the camera chip do the clean-up in hardware: a bit more contrast
+    and sharpness for text. Ignored on firmware without these settings."""
+    for prop, val in (("contrast", 2), ("sharpness", 2), ("brightness", 1)):
+        try:
+            setattr(cam, prop, val)
+        except Exception:
+            try:
+                getattr(cam, "set_" + prop)(val)
+            except Exception:
+                pass
+
+
+# Autofocus: move the lens directly (OV5640 VCM, 10-bit position, 0 = far,
+# higher = closer) and keep the sharpest of a short search. Sharpness is
+# measured on a small grid in the middle of the picture, in plain Python.
+AF_NOTE = ""
+FOCUS_POS = -1
 
 
 def _af_i2c():
@@ -2300,130 +2017,93 @@ def _wr(i2c, reg, val):
     i2c.writeto_mem(0x3C, reg, bytes((val,)), addrsize=16)
 
 
-def autofocus(cam=None):
-    """Load the focus firmware into the camera chip and focus once on the
-    middle of the picture. Returns a short status; never raises."""
-    global AF_NOTE
+def _lens(i2c, pos):
+    pos = max(0, min(1023, pos))
+    _wr(i2c, 0x3602, (_rd(i2c, 0x3602) & 0x0F) | ((pos & 0x0F) << 4))
+    _wr(i2c, 0x3603, (_rd(i2c, 0x3603) & 0xC0) | ((pos >> 4) & 0x3F))
+
+
+def _sharp(img, w, h):
+    """Edge energy of the middle of the picture: squared steps between
+    samples 2 pixels apart, on every 8th row of the middle half."""
+    tot = 0
+    x0 = w // 4
+    x1 = w - w // 4
+    for y in range(h // 4, h - h // 4, 8):
+        base = y * w
+        prev = img[base + x0]
+        for x in range(x0 + 2, x1, 2):
+            v = img[base + x]
+            d = v - prev
+            tot += d * d
+            prev = v
+    return tot
+
+
+def autofocus(cam, w, h):
+    """Search for the sharpest lens position, starting from the last one."""
+    global AF_NOTE, FOCUS_POS
     t0 = time.ticks_ms()
     try:
         i2c = _af_i2c()
         if (_rd(i2c, 0x300A), _rd(i2c, 0x300B)) != (0x56, 0x40):
             AF_NOTE = "not an OV5640"
             return AF_NOTE
-        fw = binascii.a2b_base64("".join(AF_FW))
-        _wr(i2c, 0x3000, 0x20)                    # hold the focus MCU in reset
-        for k in range(0, len(fw), 128):          # burst writes, address auto-increments
-            i2c.writeto_mem(0x3C, 0x8000 + k, fw[k:k + 128], addrsize=16)
-        if i2c.readfrom_mem(0x3C, 0x8000, 16, addrsize=16) != fw[:16] or \
-                i2c.readfrom_mem(0x3C, 0x8000 + len(fw) - 16, 16, addrsize=16) != fw[-16:]:
-            for k in range(len(fw)):              # chip didn't take bursts: byte by byte
-                _wr(i2c, 0x8000 + k, fw[k])
-        del fw
-        for reg in range(0x3022, 0x3029):
-            _wr(i2c, reg, 0)
-        _wr(i2c, 0x3029, 0x7F)
-        _wr(i2c, 0x3000, 0x00)                    # start the focus MCU
-        for _ in range(200):                      # wait for "idle" (firmware running)
-            if _rd(i2c, 0x3029) == 0x70:
-                break
-            time.sleep_ms(5)
-        else:
-            AF_NOTE = "firmware didn't start (%02x)" % _rd(i2c, 0x3029)
-            return AF_NOTE
-        # same sequence as the Arduino library that works on this board:
-        # reset the focus state, then continuous autofocus
-        _wr(i2c, 0x3022, 0x01)
-        _wr(i2c, 0x3022, 0x08)
-        for _ in range(100):
-            if _rd(i2c, 0x3023) == 0:
-                break
-            time.sleep_ms(5)
-        _wr(i2c, 0x3023, 0x01)
-        _wr(i2c, 0x3022, 0x04)                    # continuous autofocus
-        for _ in range(100):
-            if _rd(i2c, 0x3023) == 0:
-                break
-            time.sleep_ms(5)
-        st = 0
-        t1 = time.ticks_ms()
-        while time.ticks_diff(time.ticks_ms(), t1) < 3000:
-            if cam is not None:                   # keep frames flowing: the focus
-                try:                              # search measures each frame
-                    cam.capture()
-                except Exception:
-                    time.sleep_ms(30)
+        scores = {}
+
+        def score(pos):
+            pos = max(0, min(1023, pos))
+            if pos not in scores:
+                _lens(i2c, pos)
+                time.sleep_ms(30)
+                cam.capture()          # may have started before the move
+                img = cam.capture()
+                scores[pos] = _sharp(img, w, h) if img is not None and len(img) >= w * h else 0
+            return scores[pos]
+
+        last = FOCUS_POS
+        for pos in ((last - 150, last, last + 150) if 0 <= last <= 1023 else
+                    (0, 200, 400, 600, 800, 1000)):
+            score(pos)
+        for _ in range(6):             # climb towards the sharper side
+            best = max(scores, key=lambda k: scores[k])
+            if best == max(scores) and best < 1023:
+                nxt = min(1023, best + 150)
+            elif best == min(scores) and best > 0:
+                nxt = max(0, best - 150)
             else:
-                time.sleep_ms(50)
-            st = _rd(i2c, 0x3029)
-            if st == 0x10:
                 break
-        AF_NOTE = ("focused" if st == 0x10 else "focus status %02x" % st) + \
-            " in %.1fs" % (time.ticks_diff(time.ticks_ms(), t0) / 1000)
+            if nxt in scores:
+                break
+            score(nxt)
+        best = max(scores, key=lambda k: scores[k])
+        score(best - 60)
+        score(best + 60)
+        best = max(scores, key=lambda k: scores[k])
+        _lens(i2c, best)
+        time.sleep_ms(30)
+        FOCUS_POS = best
+        lo = min(scores.values())
+        AF_NOTE = "lens %d, contrast x%.1f, %d tries, %.1fs" % (
+            best, scores[best] / max(1, lo), len(scores),
+            time.ticks_diff(time.ticks_ms(), t0) / 1000)
     except Exception as e:
         AF_NOTE = "failed: " + str(e)[:40]
     return AF_NOTE
 
 
-@micropython.viper
-def _rotate(src: ptr8, dst: ptr8, w: int, h: int, c16: int, s16: int, fill: int):
-    """dst = src turned anticlockwise (c16, s16 = cos, sin x 65536), smooth
-    (bilinear) so text edges stay clean; corners outside the photo = fill."""
-    cx = w << 15            # centre, 16.16 fixed point
-    cy = h << 15
-    y = 0
-    while y < h:
-        # offsets from the centre in half pixels keep every product inside
-        # 32 bits (viper ints wrap): 65536 x 2048 at most
-        hx = 1 - w
-        hy = 2 * y + 1 - h
-        sx = ((c16 * hx - s16 * hy) >> 1) + cx - 32768
-        sy = ((s16 * hx + c16 * hy) >> 1) + cy - 32768
-        o = y * w
-        x = 0
-        while x < w:
-            ix = sx >> 16
-            iy = sy >> 16
-            if ix >= 0 and iy >= 0 and ix < w - 1 and iy < h - 1:
-                fx = (sx >> 8) & 255
-                fy = (sy >> 8) & 255
-                p = iy * w + ix
-                a = int(src[p]) * (256 - fx) + int(src[p + 1]) * fx
-                b = int(src[p + w]) * (256 - fx) + int(src[p + w + 1]) * fx
-                dst[o + x] = (a * (256 - fy) + b * fy) >> 16
-            else:
-                dst[o + x] = fill
-            sx += c16
-            sy += s16
-            x += 1
-        y += 1
-
-
-def straighten(src, w, h, dst=None):
-    """Turn the photo by PHOTO_ROTATE degrees. Returns the turned buffer."""
-    if dst is None:
-        dst = bytearray(w * h)
-    a = math.radians(PHOTO_ROTATE)
-    _rotate(src, dst, w, h, int(math.cos(a) * 65536), int(math.sin(a) * 65536), 255)
-    return dst
-
-
-def _open_camera(size):
-    """One frame buffer, filled only when we ask (WHEN_EMPTY), instead of the
-    default two buffers the camera keeps overwriting in the background. The
-    background writing was crashing the XIAO depending on where other things
-    sat in memory. Older camera firmware without these options: defaults."""
-    try:
-        from camera import GrabMode
-        return Camera(pixel_format=PixelFormat.GRAYSCALE, frame_size=size,
-                      fb_count=1, grab_mode=GrabMode.WHEN_EMPTY)
-    except (ImportError, TypeError, AttributeError) as e:
-        print("camera: default buffers (%s)" % e)
-        return Camera(pixel_format=PixelFormat.GRAYSCALE, frame_size=size)
-
-
 def _raw_photo():
     """(width, height, greyscale bytes) at the largest size that works. The
-    camera is switched off again afterwards: left running it draws power."""
+    camera is switched off again afterwards: left running it draws power.
+    Files are only touched while the camera is off (flash access while it
+    streams crashes the ESP32-S3)."""
+    global FOCUS_POS
+    try:
+        with open("focus.txt") as f:
+            FOCUS_POS = int(f.read())
+    except Exception:
+        FOCUS_POS = -1
+    start_pos = FOCUS_POS
     last = ""
     for name, w, h in PHOTO_SIZES:
         size = getattr(FrameSize, name, None)
@@ -2431,17 +2111,12 @@ def _raw_photo():
             continue
         cam = None
         try:
-            # No garbage collection while the camera runs: if a collection
-            # happens then, memory the camera is still writing into can be
-            # handed to other objects, which the camera then overwrites
-            # (crashes a moment later, e.g. while mirroring the photo).
-            gc.collect()
-            gc.disable()
-            cam = _open_camera(size)
+            cam = Camera(pixel_format=PixelFormat.GRAYSCALE, frame_size=size)
+            _tune_sensor(cam)
             time.sleep_ms(300)
             if CAM_AF:
-                cam.capture()         # get frames flowing: focusing needs them
-                print("autofocus:", autofocus(cam))
+                cam.capture()         # get frames flowing
+                print("autofocus:", autofocus(cam, w, h))
             raw = None
             for i in range(8):        # the first frames can be dark or missing
                 img = cam.capture()
@@ -2460,8 +2135,14 @@ def _raw_photo():
                     cam.deinit()
             except Exception:
                 pass
-            gc.enable()
             camera_standby()
+            if FOCUS_POS != start_pos and FOCUS_POS >= 0:
+                try:
+                    with open("focus.txt", "w") as f:
+                        f.write(str(FOCUS_POS))
+                except Exception:
+                    pass
+                start_pos = FOCUS_POS
             gc.collect()
         print("camera", last)
     raise OSError(last)
@@ -2497,39 +2178,9 @@ def _take_snapshot():
     # This camera's image comes out mirrored left-to-right: flip each row
     # (otherwise text reads backwards, for you and for the AI).
     if PHOTO_MIRROR:
-        _mirror_rows(raw, w, h)
-    if DEBUG_PHOTOS or SAVE_RAW:
-        try:
-            jr = jpeg.Encoder(width=w, height=h, pixel_format="GRAY", quality=82).encode(raw)
-            with open("last_raw.jpg", "wb") as f:
-                f.write(jr)
-            del jr
-        except Exception as e:
-            print("raw save failed:", e)
-    if DOC_ENHANCE:
-        try:
-            raw = enhance_page(raw, w, h)
-            gc.collect()
-        except Exception as e:      # out of memory etc: send the plain photo
-            print("enhance failed:", e)
-            gc.collect()
-    if PHOTO_ROTATE:
-        try:
-            raw = straighten(raw, w, h)
-            gc.collect()
-        except Exception as e:
-            print("rotate failed:", e)
-            gc.collect()
-    # preview: average 4 samples per preview pixel, then stretch the contrast
-    # (darkest 2% -> black, brightest 2% -> white) into 16 grey levels
-    grey = bytearray(SNAP_W * SNAP_H)
-    _preview(raw, w, w // SNAP_W, h // SNAP_H, grey, SNAP_W, SNAP_H)
-    srt = sorted(grey[k] for k in range(0, len(grey), 11))
-    lo = srt[len(srt) // 50]
-    hi = srt[-1 - len(srt) // 50]
-    out = bytearray(SNAP_W * SNAP_H // 2)
-    _pack4(grey, out, SNAP_W * SNAP_H, lo, max(1, hi - lo))
-    del grey
+        _mirror(raw, w, h)
+    out = _preview4(raw, w, h)
+    gc.collect()
     try:
         jpg = jpeg.Encoder(width=w, height=h, pixel_format="GRAY", quality=82).encode(raw)
     except Exception as e:
