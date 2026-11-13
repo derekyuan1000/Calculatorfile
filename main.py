@@ -62,6 +62,7 @@ except ImportError:
     import urequests
 import binascii
 import gc
+import os
 import micropython
 import json
 import math
@@ -119,7 +120,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13h-test"
+VERSION = "2026.11.13w-oldcam"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -224,6 +225,10 @@ CURRENT = ""       # SSID we are connected to
 PENDING_SSID = ""  # set by SET_SSID, completed by SET_PASS
 BSSIDS = {}        # ssid -> router MAC from the last scan (skips the scan on wake)
 ASLEEP = False     # True while WiFi is switched off to save battery
+LINK = "auto"      # internet route: "auto" (WiFi, phone as backup), "wifi" or "phone"
+ROUTE = "wifi"     # route the current request is using
+WIFI_FAILED = False  # auto mode: WiFi already failed since waking -> use the phone
+PHONE = None       # PhoneLink while Bluetooth is on
 LAST_USE = time.ticks_ms()
 HOLD_S = 0         # stay awake longer after a photo (you're deciding what to ask)
 
@@ -263,10 +268,12 @@ def _valid_net(n):
 
 
 def load_settings():
-    global MODEL, NETWORKS
+    global MODEL, NETWORKS, LINK
     d = _load_json(SETTINGS_FILE)
     if not isinstance(d, dict):
         d = {}
+    if d.get("link") in ("auto", "wifi", "phone"):
+        LINK = d["link"]
     m = d.get("model", d.get("cloud_model_hackclub", MODEL))
     MODEL = m if isinstance(m, str) and m else MODEL
     nets = d.get("networks", [])
@@ -278,7 +285,7 @@ def load_settings():
 
 
 def save_settings():
-    _save_json(SETTINGS_FILE, {"model": MODEL, "networks": NETWORKS})
+    _save_json(SETTINGS_FILE, {"model": MODEL, "networks": NETWORKS, "link": LINK})
 
 
 def known_index(ssid):
@@ -539,6 +546,11 @@ def wake_wifi():
 def recover_link():
     """Between tries of a failed request: rejoin if WiFi dropped; if it is
     still up but weak, look for a closer access point."""
+    if ROUTE == "phone":
+        if PHONE is not None and not PHONE.connected():
+            stage("Waiting for phone")
+            PHONE.wait(PHONE_WAIT_S)
+        return
     if not wlan.isconnected():
         stage("Rejoining WiFi")
         wake_wifi()
@@ -549,6 +561,8 @@ def recover_link():
 
 def weak_note():
     """Extra line for a network error message when the signal is the cause."""
+    if ROUTE == "phone":
+        return "~(via phone: is GI Link still open?)"
     r = rssi() if wlan.isconnected() else 0
     return "~WiFi signal here is weak (%d dBm)." % r if r and r < WEAK_DBM else ""
 
@@ -788,6 +802,301 @@ def remember_turn(question, answer):
     save_history()
 
 
+# ------------------------------------------------------------- phone link
+# The GI Link app on an Android phone can be the internet connection instead
+# of WiFi (useful on 5 GHz-only networks, or with no WiFi at all). The XIAO
+# talks to it over Bluetooth Low Energy (Nordic UART service) and the phone
+# makes the web requests for it:
+#   XIAO -> phone:  {"i":id,"m":"POST","u":url,"h":{headers},"n":len,"t":secs}\n + len bytes
+#   phone -> XIAO:  {"i":id,"s":status,"n":len,"h":{headers}}\n + len bytes
+#                or {"i":id,"e":"what went wrong"}\n
+# Settings > Connection on the calculator picks Auto / WiFi only / Phone only.
+try:
+    import bluetooth
+except ImportError:
+    bluetooth = None
+PHONE_NAME = "GI-calc"
+PHONE_WAIT_S = 8           # how long to wait for the app to (re)connect
+_NUS = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+_NUS_RX = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"   # phone writes here
+_NUS_TX = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"   # we notify here
+
+
+class PhoneLink:
+    def __init__(self):
+        self.ble = bluetooth.BLE()
+        self.ble.active(True)
+        try:
+            self.ble.config(gap_name=PHONE_NAME, mtu=517)
+        except Exception:
+            pass
+        self.ble.irq(self._irq)
+        rx = (bluetooth.UUID(_NUS_RX), bluetooth.FLAG_WRITE | bluetooth.FLAG_WRITE_NO_RESPONSE)
+        tx = (bluetooth.UUID(_NUS_TX), bluetooth.FLAG_NOTIFY | bluetooth.FLAG_READ)
+        ((self.tx, self.rx),) = self.ble.gatts_register_services(((bluetooth.UUID(_NUS), (tx, rx)),))
+        self.ble.gatts_set_buffer(self.rx, 8192, True)   # room for several 512-byte writes
+        self.conn = None
+        self.ready = False               # app subscribed and said hello
+        self.mtu = 23
+        self.inbuf = bytearray()
+        self.started = time.ticks_ms()
+        self.next_id = 1
+        self.advertise()
+
+    def advertise(self):
+        # flags + the service UUID (so the app finds us); name in the scan response
+        u = bytes(reversed(binascii.unhexlify(_NUS.replace("-", ""))))
+        adv = b"\x02\x01\x06" + bytes((len(u) + 1, 0x07)) + u
+        name = PHONE_NAME.encode()
+        resp = bytes((len(name) + 1, 0x09)) + name
+        try:
+            self.ble.gap_advertise(100000, adv_data=adv, resp_data=resp)
+        except Exception as e:
+            print("phone: advertise failed", e)
+
+    def _irq(self, event, data):
+        if event == 1:                     # phone connected (not ready until hello)
+            self.conn = data[0]
+            self.ready = False
+            self.inbuf = bytearray()
+        elif event == 2:                   # phone disconnected
+            self.conn = None
+            self.ready = False
+            self.mtu = 23
+            print("phone: disconnected")
+            self.advertise()
+        elif event == 3:                   # phone wrote data
+            if data[1] == self.rx:
+                self._pull()
+        elif event == 21:                  # MTU agreed
+            self.mtu = data[1]
+
+    def _pull(self):
+        """Take whatever the phone has written so far. The write events can
+        be dropped when they come in fast (MicroPython's event queue is
+        small) but the data waits in the buffer, so this is also polled."""
+        if self.conn is None:
+            return
+        try:
+            more = self.ble.gatts_read(self.rx)
+        except Exception:
+            return
+        if more:
+            self.inbuf += more
+        if not self.ready and b"hello" in bytes(self.inbuf[:64]):
+            # the app has turned on notifications: safe to send now
+            self.ready = True
+            self.inbuf = bytearray()
+            print("phone: connected")
+
+    def connected(self):
+        return self.conn is not None and self.ready
+
+    def wait(self, secs):
+        end = time.ticks_add(time.ticks_ms(), int(secs * 1000))
+        while not self.connected() and time.ticks_diff(end, time.ticks_ms()) > 0:
+            time.sleep_ms(50)
+            self._pull()
+        return self.connected()
+
+    def send(self, data):
+        # one notification = at most MTU-3 bytes, and never more than 500:
+        # Bluetooth caps a value at 512 and longer pieces get cut short
+        # (the phone then waits for bytes that never come)
+        n = max(20, min(self.mtu - 3, 500))
+        mv = memoryview(data)
+        k = 0
+        tries = 0
+        while k < len(data):
+            if self.conn is None:
+                raise OSError(128, "phone disconnected")
+            try:
+                self.ble.gatts_notify(self.conn, self.tx, mv[k:k + n])
+                k += n
+                tries = 0
+                time.sleep_ms(2)         # don't outrun the radio: dropped pieces = no answer
+            except OSError:
+                tries += 1               # send queue full: give it a moment
+                if tries > 400:
+                    raise OSError(110, "phone not reading")
+                time.sleep_ms(5)
+
+    def request(self, method, url, headers, body, timeout):
+        """One web request through the phone. Returns (status, headers, body bytes)."""
+        if not self.connected():
+            raise OSError(128, "phone not connected")
+        rid = self.next_id
+        self.next_id += 1
+        body = body or b""
+        if isinstance(body, str):
+            body = body.encode()
+        head = json.dumps({"i": rid, "m": method, "u": url, "h": headers or {},
+                           "n": len(body), "t": int(timeout)})
+        self._pull()
+        self.inbuf = bytearray()
+        self.send(head.encode() + b"\n")
+        if body:
+            self.send(body)
+        del body
+        gc.collect()
+        end = time.ticks_add(time.ticks_ms(), int((timeout + 10) * 1000))
+        hdr = None
+        skip = 0                         # body bytes of a stale answer to drop
+        while True:
+            if self.conn is None:
+                raise OSError(128, "phone disconnected")
+            if time.ticks_diff(end, time.ticks_ms()) < 0:
+                raise OSError(110, "phone timed out")
+            self._pull()
+            if skip:
+                if len(self.inbuf) < skip:
+                    time.sleep_ms(10)
+                    continue
+                self.inbuf = self.inbuf[skip:]
+                skip = 0
+            if hdr is None:
+                j = bytes(self.inbuf[:1024]).find(b"\n")   # bytearray has no find()
+                if j >= 0:
+                    try:
+                        hdr = json.loads(bytes(self.inbuf[:j]))
+                    except ValueError:
+                        hdr = {}
+                    self.inbuf = self.inbuf[j + 1:]
+                    if hdr.get("i") != rid:
+                        skip = int(hdr.get("n", 0))   # stale answer to an older request
+                        hdr = None
+                        continue
+                    if "e" in hdr:
+                        raise OSError(-1, "phone: " + str(hdr["e"])[:40])
+            if hdr is not None and len(self.inbuf) >= int(hdr.get("n", 0)):
+                n = int(hdr.get("n", 0))
+                data = bytes(self.inbuf[:n])
+                self.inbuf = self.inbuf[n:]
+                return int(hdr.get("s", 0)), hdr.get("h") or {}, data
+            time.sleep_ms(5)
+
+
+PHONE = None
+
+
+def phone_start():
+    """Bluetooth on (if a phone route is allowed): the app reconnects by itself."""
+    global PHONE
+    if PHONE is not None or bluetooth is None or LINK == "wifi":
+        return
+    try:
+        PHONE = PhoneLink()
+        print("phone: Bluetooth on, waiting for GI Link")
+    except Exception as e:
+        print("phone: Bluetooth failed:", e)
+        PHONE = None
+
+
+def phone_stop():
+    global PHONE
+    if PHONE is not None:
+        try:
+            PHONE.ble.active(False)
+        except Exception:
+            pass
+        PHONE = None
+
+
+def phone_ready(wait=PHONE_WAIT_S):
+    """'' if the phone app is connected (waiting a moment for it), else why not."""
+    if bluetooth is None:
+        return "this XIAO firmware has no Bluetooth"
+    phone_start()
+    if PHONE is None:
+        return "Bluetooth failed to start"
+    if not PHONE.connected():
+        stage("Waiting for phone")
+        PHONE.wait(wait)
+    if not PHONE.connected():
+        return "phone not connected~Open GI Link on your phone (Bluetooth on)."
+    return ""
+
+
+class PhoneResp:
+    """Looks enough like a urequests response for the code below."""
+    def __init__(self, status, headers, data):
+        self.status_code = status
+        self.headers = headers
+        self.content = data
+        self.raw = None
+
+    @property
+    def text(self):
+        return self.content.decode()
+
+    def json(self):
+        return json.loads(self.content)
+
+    def close(self):
+        self.content = b""
+
+
+def http(method, url, headers=None, data=None, json_body=None, timeout=30):
+    """A web request over the route chosen by net_ready(): WiFi or the phone."""
+    if json_body is not None:
+        data = json.dumps(json_body)
+        headers = dict(headers or {})
+        headers.setdefault("Content-Type", "application/json")
+    if ROUTE == "phone" and PHONE is not None:
+        return PhoneResp(*PHONE.request(method, url, headers, data, timeout))
+    fn = urequests.post if method == "POST" else urequests.get
+
+    def go():
+        try:
+            return fn(url, headers=headers or {}, data=data, timeout=timeout)
+        except TypeError:
+            return fn(url, headers=headers or {}, data=data)
+    try:
+        return go()
+    except (OSError, MemoryError) as e:
+        # Bluetooth and WiFi share the chip's internal memory, and a secure
+        # connection needs a lot of it: if the phone isn't in use, switch
+        # Bluetooth off and try once more before giving up.
+        if PHONE is None or PHONE.connected():
+            raise
+        print("wifi request failed with Bluetooth on (%s): retrying without it" % e)
+        phone_stop()
+        gc.collect()
+        return go()
+
+
+def net_ready():
+    """Pick the route for the next request; '' if one works, else why not.
+    auto: WiFi first; if WiFi isn't there (once per wake), the phone."""
+    global ROUTE, WIFI_FAILED
+    if LINK == "phone":
+        ROUTE = "phone"
+        return phone_ready()
+    ROUTE = "wifi"
+    if LINK == "wifi" or bluetooth is None:
+        return wifi_ready()
+    if wlan.isconnected():
+        return ""
+    phone_start()
+    if NETWORKS and not WIFI_FAILED:
+        if PHONE is not None and PHONE.connected():
+            stage("Looking for WiFi")
+            ok, msg = auto_connect()        # quick: only a network that's in range
+            print("auto: wifi", msg)
+            if ok:
+                return ""
+        elif not wifi_ready():
+            return ""
+        WIFI_FAILED = True
+    why = phone_ready()
+    if not why:
+        ROUTE = "phone"
+        return ""
+    if not NETWORKS:
+        return "no WiFi saved and " + why
+    return "no WiFi here and " + why
+
+
 def hc_post(prompt, system, max_tokens, history=(), timeout=None, model=None):
     """POST to Hack Club AI. Returns the response object (caller closes it)."""
     gc.collect()  # keep as much RAM free as possible for the TLS handshake
@@ -797,19 +1106,10 @@ def hc_post(prompt, system, max_tokens, history=(), timeout=None, model=None):
     for role, text in history:
         messages.append({"role": role, "content": text})
     messages.append({"role": "user", "content": prompt})
-    kwargs = dict(
-        headers={
-            "Authorization": "Bearer " + HC_KEY,
-            "Content-Type": "application/json",
-        },
-        json={"model": model or MODEL, "messages": messages, "max_tokens": max_tokens},
-    )
     # A stalled connection must not freeze the XIAO: give up after API_TIMEOUT s.
-    # (Older urequests has no timeout argument, so fall back without it.)
-    try:
-        return urequests.post(HC_URL, timeout=timeout or API_TIMEOUT, **kwargs)
-    except TypeError:
-        return urequests.post(HC_URL, **kwargs)
+    return http("POST", HC_URL, {"Authorization": "Bearer " + HC_KEY},
+                json_body={"model": model or MODEL, "messages": messages, "max_tokens": max_tokens},
+                timeout=timeout or API_TIMEOUT)
 
 
 def left(deadline):
@@ -847,7 +1147,7 @@ def ready_to_ask():
     """'' if a question can go out now, else the reason it can't."""
     if not HC_KEY:
         return "no API key: copy .env to the XIAO~(mpremote connect COMx cp .env :.env)"
-    return wifi_ready()
+    return net_ready()
 
 
 def wifi_ready():
@@ -932,12 +1232,29 @@ def ask_ai(prompt, tries=3):
 
 
 def run_test():
-    """WiFi -> DNS -> a tiny real API call. Lines joined with ~."""
-    if not wlan.isconnected():
-        wake_wifi()
+    """WiFi (or phone) -> DNS -> a tiny real API call. Lines joined with ~."""
+    global ROUTE
+    why = net_ready()
+    if ROUTE == "phone":
+        lines = ["main.py " + VERSION, "Route: phone (GI Link)"]
+        if why:
+            return "ERR:" + "~".join(lines + [why])
+        t0 = time.ticks_ms()
+        try:
+            resp = hc_post("hi", None, 16)
+            code = resp.status_code
+            resp.close()
+        except Exception as e:
+            return "ERR:" + "~".join(lines + ["Phone request failed: " + str(e)[:40]])
+        secs = time.ticks_diff(time.ticks_ms(), t0) / 1000
+        if code == 200:
+            return "OK:" + "~".join(lines + ["Server ok, %.1fs" % secs])
+        return "ERR:" + "~".join(lines + ["Server: " + describe_status(code)])
     if not wlan.isconnected():
         return "ERR:WiFi: not connected~Check SSID and password, then use the WiFi row."
     lines = ["main.py " + VERSION]
+    if SNAP_CRASH:
+        lines.append("Last photo crashed " + SNAP_CRASH.replace("~", ", ")[:90])
     try:
         lines.append("%s %d dBm" % (CURRENT or "WiFi ok", wlan.status("rssi")))
     except Exception:
@@ -1622,10 +1939,10 @@ LAST_SNAP = None          # JPEG bytes of the last photo
 SNAP_W, SNAP_H = 256, 192  # preview size, drawn 1:1 on the calculator
 PHOTO_DEFAULT = "Solve the question in this photo. Show full working."
 PHOTO_SIZES = (("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480))
-DEBUG_PHOTOS = True       # TEMPORARY: upload each photo (processed + raw) to catbox.moe and
+DEBUG_PHOTOS = False      # testing aid: upload each photo (processed + raw) to catbox.moe and
                           # show the links under the answer. Set False when done testing.
-CAM_AF = True             # autofocus: load the OV5640's focus firmware and focus before
-                          # each photo (without it the lens sits at its far-away rest point)
+CAM_AF = True             # autofocus: sweep the lens and keep the sharpest position
+                          # (without it the lens sits at its far-away rest point)
 PHOTO_ROTATE = 21         # degrees: straighten the picture (camera sits tilted in the case);
                           # + turns the picture anticlockwise, 0 = off
 DOC_ENHANCE = True        # clean up photos for reading: even light, crisp text
@@ -1848,6 +2165,28 @@ def _apply_lut(buf: ptr8, n: int, lut: ptr8):
         i += 1
 
 
+@micropython.viper
+def _dark_pct(buf: ptr8, n: int, step: int, frac: int) -> int:
+    """Grey level below which 1/frac of the (sampled) pixels lie."""
+    hist = bytearray(1024)
+    h32 = ptr32(hist)
+    k = 0
+    cnt = 0
+    while k < n:
+        h32[buf[k]] += 1
+        cnt += 1
+        k += step
+    need = cnt // frac
+    acc = 0
+    v = 0
+    while v < 256:
+        acc += h32[v]
+        if acc >= need:
+            return v
+        v += 1
+    return 255
+
+
 def enhance_page(raw, w, h):
     """Make a photo of a page easier to read (for people and for the AI):
     1. even out the light (shadows, glare gradients), paper -> white
@@ -1869,17 +2208,7 @@ def enhance_page(raw, w, h):
     out = bytearray(w * h)
     _sharpen(raw, out, w, h, 1, 3)
     # contrast: darkest 1% -> black, paper stays white; a little extra bite
-    hist = [0] * 256
-    for k in range(0, w * h, 7):
-        hist[out[k]] += 1
-    n = sum(hist)
-    acc = 0
-    lo = 0
-    for v in range(256):
-        acc += hist[v]
-        if acc >= n // 100:
-            lo = v
-            break
+    lo = _dark_pct(out, w * h, 7, 100)     # 1% darkest level (fast, viper)
     hi = 244 if mid >= 110 else 250   # paper -> white, light greys kept
     span = max(40, hi - lo)
     lut = bytearray(256)
@@ -1889,6 +2218,160 @@ def enhance_page(raw, w, h):
     _apply_lut(out, w * h, lut)
     print("enhance %d ms" % time.ticks_diff(time.ticks_ms(), t0))
     return out
+
+
+# Autofocus, done here rather than by the camera chip. The OV5640's own
+# focus firmware loads but never finishes a search on this board, so the
+# lens is moved directly (its VCM driver: a 10-bit position, 0 = far away,
+# higher = closer) and the sharpest of a quick sweep is kept:
+#   starts at the last photo's position (focus.txt), climbs to the sharpest,
+#   then checks either side. About 5-8 frames pairs. CAM_AF = False skips it (lens rests at far away).
+AF_NOTE = ""              # last autofocus result, shown in debug output
+FOCUS_POS = -1            # last good lens position (tried first next time)
+
+
+def _af_i2c():
+    from machine import SoftI2C
+    return SoftI2C(scl=Pin(39), sda=Pin(40), freq=400000)
+
+
+def _rd(i2c, reg):
+    return i2c.readfrom_mem(0x3C, reg, 1, addrsize=16)[0]
+
+
+def _wr(i2c, reg, val):
+    i2c.writeto_mem(0x3C, reg, bytes((val,)), addrsize=16)
+
+
+def _lens(i2c, pos):
+    """Move the lens: DAC bits 3:0 -> 0x3602 bits 7:4, bits 9:4 -> 0x3603 bits 5:0."""
+    pos = max(0, min(1023, pos))
+    _wr(i2c, 0x3602, (_rd(i2c, 0x3602) & 0x0F) | ((pos & 0x0F) << 4))
+    _wr(i2c, 0x3603, (_rd(i2c, 0x3603) & 0xC0) | ((pos >> 4) & 0x3F))
+
+
+@micropython.viper
+def _sharpness(img: ptr8, w: int, h: int) -> int:
+    """Edge energy of the middle of the picture (where you aim): sum of
+    squared brightness steps, sampled on every 2nd row/column."""
+    x0 = w >> 2
+    x1 = w - (w >> 2)
+    y = h >> 2
+    y1 = h - (h >> 2)
+    tot = 0
+    while y < y1:
+        p = y * w + x0
+        e = y * w + x1
+        while p < e:
+            d = int(img[p]) - int(img[p + 2])
+            v = int(img[p]) - int(img[p + 2 * w])
+            tot += (d * d + v * v) >> 4
+            p += 2
+        y += 2
+    return tot
+
+
+def autofocus(cam, w, h):
+    """Sweep the lens and leave it at the sharpest position. Never raises."""
+    global AF_NOTE, FOCUS_POS
+    t0 = time.ticks_ms()
+    try:
+        rtc_stage("focus: talking to the camera chip")
+        i2c = _af_i2c()
+        if (_rd(i2c, 0x300A), _rd(i2c, 0x300B)) != (0x56, 0x40):
+            AF_NOTE = "not an OV5640"
+            return AF_NOTE
+        scores = {}
+
+        def score(pos):
+            if pos in scores:
+                return scores[pos]
+            rtc_stage("focus: lens %d" % pos)
+            _lens(i2c, pos)
+            time.sleep_ms(30)          # let the lens settle
+            cam.capture()              # this frame may have started before the move
+            img = cam.capture()
+            sc = _sharpness(img, w, h) if img is not None and len(img) >= w * h else 0
+            scores[pos] = sc
+            return sc
+
+        # start where the last photo was focused (read from focus.txt by
+        # _raw_photo before the camera started), else a coarse sweep; then
+        # climb towards the sharper side
+        last = FOCUS_POS
+        if 0 <= last <= 1023:
+            for pos in (last - 150, last, last + 150):
+                score(max(0, min(1023, pos)))
+        else:
+            for pos in (0, 200, 400, 600, 800, 1000):
+                score(pos)
+        for _ in range(6):
+            best = max(scores, key=lambda k: scores[k])
+            nxt = None
+            if best == max(scores) and best < 1023:
+                nxt = min(1023, best + 150)
+            elif best == min(scores) and best > 0:
+                nxt = max(0, best - 150)
+            if nxt is None or nxt in scores:
+                break
+            score(nxt)
+        best = max(scores, key=lambda k: scores[k])
+        for pos in (best - 60, best + 60):
+            if 0 <= pos <= 1023:
+                score(pos)
+        best = max(scores, key=lambda k: scores[k])
+        _lens(i2c, best)
+        time.sleep_ms(30)
+        FOCUS_POS = best               # saved to focus.txt once the camera is off
+        lo = min(scores.values())
+        AF_NOTE = "lens %d, contrast x%.1f, %d tries, %.1fs" % (
+            best, scores[best] / max(1, lo), len(scores), time.ticks_diff(time.ticks_ms(), t0) / 1000)
+    except Exception as e:
+        AF_NOTE = "failed: " + str(e)[:40]
+    return AF_NOTE
+
+
+@micropython.viper
+def _rotate(src: ptr8, dst: ptr8, w: int, h: int, c16: int, s16: int, fill: int):
+    """dst = src turned anticlockwise (c16, s16 = cos, sin x 65536), smooth
+    (bilinear) so text edges stay clean; corners outside the photo = fill."""
+    cx = w << 15            # centre, 16.16 fixed point
+    cy = h << 15
+    y = 0
+    while y < h:
+        # offsets from the centre in half pixels keep every product inside
+        # 32 bits (viper ints wrap): 65536 x 2048 at most
+        hx = 1 - w
+        hy = 2 * y + 1 - h
+        sx = ((c16 * hx - s16 * hy) >> 1) + cx - 32768
+        sy = ((s16 * hx + c16 * hy) >> 1) + cy - 32768
+        o = y * w
+        x = 0
+        while x < w:
+            ix = sx >> 16
+            iy = sy >> 16
+            if ix >= 0 and iy >= 0 and ix < w - 1 and iy < h - 1:
+                fx = (sx >> 8) & 255
+                fy = (sy >> 8) & 255
+                p = iy * w + ix
+                a = int(src[p]) * (256 - fx) + int(src[p + 1]) * fx
+                b = int(src[p + w]) * (256 - fx) + int(src[p + w + 1]) * fx
+                dst[o + x] = (a * (256 - fy) + b * fy) >> 16
+            else:
+                dst[o + x] = fill
+            sx += c16
+            sy += s16
+            x += 1
+        y += 1
+
+
+def straighten(src, w, h, dst=None):
+    """Turn the photo by PHOTO_ROTATE degrees. Returns the turned buffer."""
+    if dst is None:
+        dst = bytearray(w * h)
+    a = math.radians(PHOTO_ROTATE)
+    _rotate(src, dst, w, h, int(math.cos(a) * 65536), int(math.sin(a) * 65536), 255)
+    return dst
 
 
 # OV5640 autofocus firmware (4077 bytes, from github.com/0015/ESP32-OV5640-AF,
@@ -1984,7 +2467,7 @@ def _wr(i2c, reg, val):
     i2c.writeto_mem(0x3C, reg, bytes((val,)), addrsize=16)
 
 
-def autofocus(cam=None):
+def autofocus_fw(cam=None):
     """Load the focus firmware into the camera chip and focus once on the
     middle of the picture. Returns a short status; never raises."""
     global AF_NOTE
@@ -2048,48 +2531,6 @@ def autofocus(cam=None):
     return AF_NOTE
 
 
-@micropython.viper
-def _rotate(src: ptr8, dst: ptr8, w: int, h: int, c16: int, s16: int, fill: int):
-    """dst = src turned anticlockwise (c16, s16 = cos, sin x 65536), smooth
-    (bilinear) so text edges stay clean; corners outside the photo = fill."""
-    cx = w << 15            # centre, 16.16 fixed point
-    cy = h << 15
-    y = 0
-    while y < h:
-        # offsets from the centre in half pixels keep every product inside
-        # 32 bits (viper ints wrap): 65536 x 2048 at most
-        hx = 1 - w
-        hy = 2 * y + 1 - h
-        sx = ((c16 * hx - s16 * hy) >> 1) + cx - 32768
-        sy = ((s16 * hx + c16 * hy) >> 1) + cy - 32768
-        o = y * w
-        x = 0
-        while x < w:
-            ix = sx >> 16
-            iy = sy >> 16
-            if ix >= 0 and iy >= 0 and ix < w - 1 and iy < h - 1:
-                fx = (sx >> 8) & 255
-                fy = (sy >> 8) & 255
-                p = iy * w + ix
-                a = int(src[p]) * (256 - fx) + int(src[p + 1]) * fx
-                b = int(src[p + w]) * (256 - fx) + int(src[p + w + 1]) * fx
-                dst[o + x] = (a * (256 - fy) + b * fy) >> 16
-            else:
-                dst[o + x] = fill
-            sx += c16
-            sy += s16
-            x += 1
-        y += 1
-
-
-def straighten(src, w, h, dst=None):
-    """Turn the photo by PHOTO_ROTATE degrees. Returns the turned buffer."""
-    if dst is None:
-        dst = bytearray(w * h)
-    a = math.radians(PHOTO_ROTATE)
-    _rotate(src, dst, w, h, int(math.cos(a) * 65536), int(math.sin(a) * 65536), 255)
-    return dst
-
 
 def _raw_photo():
     """(width, height, greyscale bytes) at the largest size that works. The
@@ -2105,7 +2546,7 @@ def _raw_photo():
             time.sleep_ms(300)
             if CAM_AF:
                 cam.capture()         # get frames flowing: focusing needs them
-                print("autofocus:", autofocus(cam))
+                print("autofocus:", autofocus_fw(cam))
             raw = None
             for i in range(8):        # the first frames can be dark or missing
                 img = cam.capture()
@@ -2130,7 +2571,106 @@ def _raw_photo():
     raise OSError(last)
 
 
+
+SNAP_CRASH = ""       # set at boot if the last photo restarted the XIAO
+
+
+def snap_stage(name):
+    """Note which photo step is running, in flash. If the XIAO restarts in the
+    middle, the next boot finds the note and the calculator is told where it
+    died (no cable needed). name=None: photo finished, remove the note."""
+    try:
+        if name is None:
+            os.remove("snap.stage")
+        else:
+            with open("snap.stage", "w") as f:
+                f.write(name)
+    except OSError:
+        pass
+
+
+def rtc_stage(name):
+    """Finer photo steps while the camera runs: kept in RTC memory (RAM that
+    survives a crash restart), because flash must not be touched then."""
+    try:
+        d = _rtc_get()
+        if name is None:
+            d.pop("snap", None)
+        else:
+            d["snap"] = name
+        _rtc_put(d)
+    except Exception:
+        pass
+
+
+AF_SKIP = False       # the last photo crashed while focusing: try one without
+
+
+def check_snap_crash():
+    """At boot: did the last photo restart us? Remember it for GET_SNAP/Test."""
+    global SNAP_CRASH, AF_SKIP
+    try:
+        with open("snap.stage") as f:
+            stage = f.read().strip()
+    except OSError:
+        rtc_stage(None)
+        return
+    snap_stage(None)
+    fine = ""
+    try:
+        fine = _rtc_get().get("snap", "")
+    except Exception:
+        pass
+    rtc_stage(None)
+    if fine:
+        stage = fine
+    if "focus" in stage:
+        AF_SKIP = True
+    try:
+        cause = machine.reset_cause()
+    except Exception:
+        cause = -1
+    names = {1: "power on / brownout", 2: "hard reset", 3: "watchdog", 4: "deep sleep",
+             5: "soft reset"}
+    why = names.get(cause, "crash")
+    try:
+        r = machine.mem32[0x60008038] & 0x3F   # RTC_CNTL_RESET_STATE_REG, CPU0 reason
+        why += {0x0F: ": brownout (battery low?)", 0x0C: ": crash (CPU reset)",
+                0x10: ": watchdog", 0x07: ": watchdog"}.get(r, ": code 0x%02x" % r)
+    except Exception:
+        pass
+    SNAP_CRASH = "during: %s~reset cause: %s (%d)" % (stage, why, cause)
+    try:
+        with open("crash.txt") as f:
+            last = [l.strip() for l in f.read().split("\n") if l.strip()][-2:]
+        SNAP_CRASH += "~" + " / ".join(last)[:80]
+    except OSError:
+        pass
+    print("last photo crashed the XIAO", SNAP_CRASH)
+
+
 def take_snapshot():
+    """GET_SNAP: Bluetooth is switched off while the camera runs (the two
+    together restart the XIAO), then back on so the phone reconnects."""
+    global SNAP_CRASH
+    if SNAP_CRASH:                 # the last try restarted the XIAO: say where
+        why = SNAP_CRASH
+        SNAP_CRASH = ""
+        return "ERR:The camera restarted the XIAO~" + why + "~Send this to Claude. F6 tries again" + \
+            (" without autofocus." if AF_SKIP else ".")
+    bt = PHONE is not None
+    if bt:
+        phone_stop()
+        gc.collect()
+    try:
+        return _take_snapshot()
+    finally:
+        snap_stage(None)           # only a hard restart leaves the note behind
+        if bt:
+            phone_start()
+
+
+def _take_snapshot():
     """GET_SNAP: reply SNAP:256x192:<base64 of 4-bit greys> or ERR:..."""
     global LAST_SNAP
     if Camera is None:
@@ -2405,7 +2945,7 @@ def do_update():
                 "mpremote connect COMx cp .env :.env")
     if not UPDATE_URL.startswith("https://"):
         return "ERR:UPDATE_URL must start with https://"
-    why = wifi_ready()
+    why = net_ready()
     if why:
         return "ERR:" + why
     stage("Downloading update")
@@ -2414,10 +2954,7 @@ def do_update():
         headers["Authorization"] = "token " + UPDATE_TOKEN
     gc.collect()
     try:
-        try:
-            resp = urequests.get(UPDATE_URL, headers=headers, timeout=30)
-        except TypeError:
-            resp = urequests.get(UPDATE_URL, headers=headers)
+        resp = http("GET", UPDATE_URL, headers, timeout=60)
     except Exception as e:
         return "ERR:Download failed: " + net_error(e)
     done = False
@@ -2517,7 +3054,7 @@ def rollback():
 
 
 def handle_line(line):
-    global MODEL, CURRENT, PENDING_SSID
+    global MODEL, CURRENT, PENDING_SSID, LINK
     if line == "GET_UPDATE":
         try:
             return do_update()
@@ -2528,7 +3065,28 @@ def handle_line(line):
         # wifi field: 1 connected, S asleep (rejoins on the next question), 0 offline
         up = wlan.isconnected()
         state = "1" if up else ("S" if ASLEEP and CURRENT else "0")
-        return "OK:%s|%d|%s|%s" % (MODEL, len(NETWORKS), state, CURRENT if state != "0" else "")
+        name = CURRENT if state != "0" else ""
+        if not up and PHONE is not None and PHONE.connected() and LINK != "wifi":
+            state, name = "1", "Phone"
+        return "OK:%s|%d|%s|%s" % (MODEL, len(NETWORKS), state, name)
+    if line == "GET_LINK":
+        # mode|bluetooth available|phone connected now
+        return "OK:%s|%d|%d" % (LINK, bluetooth is not None,
+                                PHONE is not None and PHONE.connected())
+    if line.startswith("SET_LINK:"):
+        v = line[len("SET_LINK:"):].strip().lower()
+        if v not in ("auto", "wifi", "phone"):
+            return "ERR:Use auto, wifi or phone"
+        if v != "wifi" and bluetooth is None:
+            return "ERR:This XIAO firmware has no Bluetooth"
+        LINK = v
+        save_settings()
+        if v == "wifi":
+            phone_stop()
+        else:
+            phone_start()
+        return "OK:" + {"auto": "WiFi first, phone as backup",
+                        "wifi": "WiFi only", "phone": "Phone only"}[v]
     if line == "GET_NETS":
         try:
             return nets_reply()
@@ -2645,6 +3203,7 @@ def main():
         count_wake("ext0")
     load_settings()
     load_history()
+    check_snap_crash()
     buf = b""
     heard = False  # any byte at all since waking
     if woke:
@@ -2680,6 +3239,7 @@ def main():
         except Exception:
             pass
     LAST_USE = time.ticks_ms()
+    phone_start()     # phone app can reconnect while we wait for the question
     set_cpu(IDLE_HZ)  # full speed only once there is work to do
     print("listening for the calculator...")
     while True:
