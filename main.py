@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13c"
+VERSION = "2026.11.13d"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1734,8 +1734,8 @@ def _paper(grid: ptr8, gw: int, gh: int, out: ptr8):
                                 m = v
                         dx += 1
                 dy += 1
-            if m < 40:
-                m = 40
+            if m < 140:         # at most ~1.7x lift: pages, not screens
+                m = 140
             out[y * gw + x] = m
             x += 1
         y += 1
@@ -1856,10 +1856,14 @@ def enhance_page(raw, w, h):
     grid = bytearray(gw * gh)
     paper = bytearray(gw * gh)
     _cells(raw, w, h, DOC_CELL, grid, gw, gh)
-    _paper(grid, gw, gh, paper)
-    _flatten(raw, w, h, DOC_CELL, paper, gw, gh, bytearray(gw + 1), 238)
+    # lighting fix only for pages (mostly light). Dark scenes and screens
+    # have no "paper", dividing by the bright surroundings blows them out.
+    mid = sorted(grid)[len(grid) // 2]
+    if mid >= 110:
+        _paper(grid, gw, gh, paper)
+        _flatten(raw, w, h, DOC_CELL, paper, gw, gh, bytearray(gw + 1), 238)
     out = bytearray(w * h)
-    _sharpen(raw, out, w, h, 2, 6)
+    _sharpen(raw, out, w, h, 1, 4)
     # contrast: darkest 1% -> black, paper stays white; a little extra bite
     hist = [0] * 256
     for k in range(0, w * h, 7):
@@ -1872,7 +1876,7 @@ def enhance_page(raw, w, h):
         if acc >= n // 100:
             lo = v
             break
-    hi = 235
+    hi = 235 if mid >= 110 else 250
     span = max(40, hi - lo)
     lut = bytearray(256)
     for v in range(256):
