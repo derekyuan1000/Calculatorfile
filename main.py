@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13p"
+VERSION = "2026.11.13r"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -227,6 +227,7 @@ ASLEEP = False     # True while WiFi is switched off to save battery
 LINK = "auto"      # internet route: "auto" (WiFi, phone as backup), "wifi" or "phone"
 ROUTE = "wifi"     # route the current request is using
 WIFI_FAILED = False  # auto mode: WiFi already failed since waking -> use the phone
+PHONE = None       # PhoneLink while Bluetooth is on
 LAST_USE = time.ticks_ms()
 HOLD_S = 0         # stay awake longer after a photo (you're deciding what to ask)
 
@@ -865,14 +866,27 @@ class PhoneLink:
             self.advertise()
         elif event == 3:                   # phone wrote data
             if data[1] == self.rx:
-                self.inbuf += self.ble.gatts_read(self.rx)
-                if not self.ready and b"hello" in bytes(self.inbuf[:64]):
-                    # the app has turned on notifications: safe to send now
-                    self.ready = True
-                    self.inbuf = bytearray()
-                    print("phone: connected")
+                self._pull()
         elif event == 21:                  # MTU agreed
             self.mtu = data[1]
+
+    def _pull(self):
+        """Take whatever the phone has written so far. The write events can
+        be dropped when they come in fast (MicroPython's event queue is
+        small) but the data waits in the buffer, so this is also polled."""
+        if self.conn is None:
+            return
+        try:
+            more = self.ble.gatts_read(self.rx)
+        except Exception:
+            return
+        if more:
+            self.inbuf += more
+        if not self.ready and b"hello" in bytes(self.inbuf[:64]):
+            # the app has turned on notifications: safe to send now
+            self.ready = True
+            self.inbuf = bytearray()
+            print("phone: connected")
 
     def connected(self):
         return self.conn is not None and self.ready
@@ -881,6 +895,7 @@ class PhoneLink:
         end = time.ticks_add(time.ticks_ms(), int(secs * 1000))
         while not self.connected() and time.ticks_diff(end, time.ticks_ms()) > 0:
             time.sleep_ms(50)
+            self._pull()
         return self.connected()
 
     def send(self, data):
@@ -895,6 +910,7 @@ class PhoneLink:
                 self.ble.gatts_notify(self.conn, self.tx, mv[k:k + n])
                 k += n
                 tries = 0
+                time.sleep_ms(2)         # don't outrun the radio: dropped pieces = no answer
             except OSError:
                 tries += 1               # send queue full: give it a moment
                 if tries > 400:
@@ -912,6 +928,7 @@ class PhoneLink:
             body = body.encode()
         head = json.dumps({"i": rid, "m": method, "u": url, "h": headers or {},
                            "n": len(body), "t": int(timeout)})
+        self._pull()
         self.inbuf = bytearray()
         self.send(head.encode() + b"\n")
         if body:
@@ -926,6 +943,7 @@ class PhoneLink:
                 raise OSError(128, "phone disconnected")
             if time.ticks_diff(end, time.ticks_ms()) < 0:
                 raise OSError(110, "phone timed out")
+            self._pull()
             if skip:
                 if len(self.inbuf) < skip:
                     time.sleep_ms(10)
@@ -951,7 +969,7 @@ class PhoneLink:
                 data = bytes(self.inbuf[:n])
                 self.inbuf = self.inbuf[n:]
                 return int(hdr.get("s", 0)), hdr.get("h") or {}, data
-            time.sleep_ms(10)
+            time.sleep_ms(5)
 
 
 PHONE = None
