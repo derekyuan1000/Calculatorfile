@@ -62,6 +62,7 @@ except ImportError:
     import urequests
 import binascii
 import gc
+import os
 import micropython
 import json
 import math
@@ -119,7 +120,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13t"
+VERSION = "2026.11.13u"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1252,6 +1253,8 @@ def run_test():
     if not wlan.isconnected():
         return "ERR:WiFi: not connected~Check SSID and password, then use the WiFi row."
     lines = ["main.py " + VERSION]
+    if SNAP_CRASH:
+        lines.append("Last photo crashed " + SNAP_CRASH.replace("~", ", ")[:90])
     try:
         lines.append("%s %d dBm" % (CURRENT or "WiFi ok", wlan.status("rssi")))
     except Exception:
@@ -2388,11 +2391,15 @@ def _raw_photo():
             continue
         cam = None
         try:
+            snap_stage("camera start " + name)
             cam = Camera(pixel_format=PixelFormat.GRAYSCALE, frame_size=size)
             time.sleep_ms(300)
             if CAM_AF:
+                snap_stage("first frame")
                 cam.capture()         # get frames flowing
+                snap_stage("autofocus")
                 print("autofocus:", autofocus(cam, w, h))
+            snap_stage("capture")
             raw = None
             for i in range(8):        # the first frames can be dark or missing
                 img = cam.capture()
@@ -2406,20 +2413,69 @@ def _raw_photo():
         except Exception as e:
             last = "%s: %s" % (name, e)
         finally:
+            snap_stage("camera off")
             try:
                 if cam is not None:
                     cam.deinit()
             except Exception:
                 pass
+            snap_stage("camera standby")
             camera_standby()
             gc.collect()
         print("camera", last)
     raise OSError(last)
 
 
+SNAP_CRASH = ""       # set at boot if the last photo restarted the XIAO
+
+
+def snap_stage(name):
+    """Note which photo step is running, in flash. If the XIAO restarts in the
+    middle, the next boot finds the note and the calculator is told where it
+    died (no cable needed). name=None: photo finished, remove the note."""
+    try:
+        if name is None:
+            os.remove("snap.stage")
+        else:
+            with open("snap.stage", "w") as f:
+                f.write(name)
+    except OSError:
+        pass
+
+
+def check_snap_crash():
+    """At boot: did the last photo restart us? Remember it for GET_SNAP/Test."""
+    global SNAP_CRASH
+    try:
+        with open("snap.stage") as f:
+            stage = f.read().strip()
+    except OSError:
+        return
+    snap_stage(None)
+    try:
+        cause = machine.reset_cause()
+    except Exception:
+        cause = -1
+    names = {1: "power on / brownout", 2: "hard reset", 3: "watchdog", 4: "deep sleep",
+             5: "soft reset"}
+    SNAP_CRASH = "during: %s~reset cause: %s (%d)" % (stage, names.get(cause, "crash"), cause)
+    try:
+        with open("crash.txt") as f:
+            last = [l.strip() for l in f.read().split("\n") if l.strip()][-2:]
+        SNAP_CRASH += "~" + " / ".join(last)[:80]
+    except OSError:
+        pass
+    print("last photo crashed the XIAO", SNAP_CRASH)
+
+
 def take_snapshot():
     """GET_SNAP: Bluetooth is switched off while the camera runs (the two
     together restart the XIAO), then back on so the phone reconnects."""
+    global SNAP_CRASH
+    if SNAP_CRASH:                 # the last try restarted the XIAO: say where
+        why = SNAP_CRASH
+        SNAP_CRASH = ""
+        return "ERR:The camera restarted the XIAO~" + why + "~Send this to Claude. F6 tries again."
     bt = PHONE is not None
     if bt:
         phone_stop()
@@ -2427,6 +2483,7 @@ def take_snapshot():
     try:
         return _take_snapshot()
     finally:
+        snap_stage(None)           # only a hard restart leaves the note behind
         if bt:
             phone_start()
 
@@ -2442,6 +2499,7 @@ def _take_snapshot():
     try:
         w, h, raw = _raw_photo()
         CAP_S = time.ticks_diff(time.ticks_ms(), t0) / 1000
+        snap_stage("mirror")
     except Exception as e:
         return "ERR:Camera failed~" + str(e)[:90] + "~Is the camera board clicked on fully?"
     # This camera's image comes out mirrored left-to-right: flip each row
@@ -2456,6 +2514,7 @@ def _take_snapshot():
             del jr
         except Exception as e:
             print("raw save failed:", e)
+    snap_stage("enhance")
     if DOC_ENHANCE:
         try:
             raw = enhance_page(raw, w, h)
@@ -2463,6 +2522,7 @@ def _take_snapshot():
         except Exception as e:      # out of memory etc: send the plain photo
             print("enhance failed:", e)
             gc.collect()
+    snap_stage("rotate")
     if PHOTO_ROTATE:
         try:
             raw = straighten(raw, w, h)
@@ -2472,6 +2532,7 @@ def _take_snapshot():
             gc.collect()
     # preview: average 4 samples per preview pixel, then stretch the contrast
     # (darkest 2% -> black, brightest 2% -> white) into 16 grey levels
+    snap_stage("preview")
     grey = bytearray(SNAP_W * SNAP_H)
     _preview(raw, w, w // SNAP_W, h // SNAP_H, grey, SNAP_W, SNAP_H)
     srt = sorted(grey[k] for k in range(0, len(grey), 11))
@@ -2480,10 +2541,12 @@ def _take_snapshot():
     out = bytearray(SNAP_W * SNAP_H // 2)
     _pack4(grey, out, SNAP_W * SNAP_H, lo, max(1, hi - lo))
     del grey
+    snap_stage("jpeg")
     try:
         jpg = jpeg.Encoder(width=w, height=h, pixel_format="GRAY", quality=82).encode(raw)
     except Exception as e:
         return "ERR:Could not compress the photo~" + str(e)[:80]
+    snap_stage("save")
     del raw
     gc.collect()
     LAST_SNAP = jpg
@@ -2964,6 +3027,7 @@ def main():
         count_wake("ext0")
     load_settings()
     load_history()
+    check_snap_crash()
     buf = b""
     heard = False  # any byte at all since waking
     if woke:
