@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.14d"
+VERSION = "2026.11.14e"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -2064,13 +2064,15 @@ def _sharp(img, w, h):
     tot = 0
     x0 = w // 4
     x1 = w - w // 4
+    w2 = 2 * w
     for y in range(h // 4, h - h // 4, 8):
         base = y * w
         prev = img[base + x0]
         for x in range(x0 + 2, x1, 2):
             v = img[base + x]
-            d = v - prev
-            tot += d * d
+            d = v - prev                 # left-right step (vertical strokes)
+            e = img[base + w2 + x] - v   # up-down step (horizontal strokes)
+            tot += d * d + e * e
             prev = v
     return tot
 
@@ -2112,6 +2114,11 @@ def autofocus(cam, w, h):
                 break
             score(nxt)
         best = max(scores, key=lambda k: scores[k])
+        if scores[best] < 2 * max(1, min(scores.values())) and 0 <= last <= 1023:
+            # hardly any difference near the old spot: look across the whole range
+            for pos in (0, 200, 400, 600, 800, 1000):
+                score(pos)
+            best = max(scores, key=lambda k: scores[k])
         score(best - 60)
         score(best + 60)
         best = max(scores, key=lambda k: scores[k])
@@ -2269,9 +2276,9 @@ def upload_photo(path):
         body = head.encode() + data + ("\r\n--%s--\r\n" % b).encode()
         del data
         gc.collect()
-        r = urequests.post("https://catbox.moe/user/api.php", data=body,
-                           headers={"Content-Type": "multipart/form-data; boundary=" + b,
-                                    "User-Agent": "G-Intelligence"})
+        r = http("POST", "https://catbox.moe/user/api.php",
+                 {"Content-Type": "multipart/form-data; boundary=" + b,
+                  "User-Agent": "G-Intelligence"}, data=body, timeout=60)
         try:
             t = r.text.strip()
             return t if t.startswith("https://") else ""
