@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13z"
+VERSION = "2026.11.14a"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -2431,6 +2431,12 @@ def _raw_photo():
             continue
         cam = None
         try:
+            # No garbage collection while the camera runs: if a collection
+            # happens then, memory the camera is still writing into can be
+            # handed to other objects, which the camera then overwrites
+            # (crashes a moment later, e.g. while mirroring the photo).
+            gc.collect()
+            gc.disable()
             cam = _open_camera(size)
             time.sleep_ms(300)
             if CAM_AF:
@@ -2454,6 +2460,7 @@ def _raw_photo():
                     cam.deinit()
             except Exception:
                 pass
+            gc.enable()
             camera_standby()
             gc.collect()
         print("camera", last)
