@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13x"
+VERSION = "2026.11.13y"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1936,6 +1936,8 @@ LAST_SNAP = None          # JPEG bytes of the last photo
 SNAP_W, SNAP_H = 256, 192  # preview size, drawn 1:1 on the calculator
 PHOTO_DEFAULT = "Solve the question in this photo. Show full working."
 PHOTO_SIZES = (("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480))
+SAVE_RAW = True           # keep last_raw.jpg (the unprocessed photo); the working
+                          # version always did this and photos crash without it
 DEBUG_PHOTOS = False      # testing aid: upload each photo (processed + raw) to catbox.moe and
                           # show the links under the answer. Set False when done testing.
 CAM_AF = True             # autofocus: load the OV5640's focus firmware and focus before
@@ -2475,7 +2477,7 @@ def _take_snapshot():
     # (otherwise text reads backwards, for you and for the AI).
     if PHOTO_MIRROR:
         _mirror_rows(raw, w, h)
-    if DEBUG_PHOTOS:
+    if DEBUG_PHOTOS or SAVE_RAW:
         try:
             jr = jpeg.Encoder(width=w, height=h, pixel_format="GRAY", quality=82).encode(raw)
             with open("last_raw.jpg", "wb") as f:
