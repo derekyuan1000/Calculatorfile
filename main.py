@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.12"
+VERSION = "2026.11.13"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1620,7 +1620,12 @@ except ImportError:
 LAST_SNAP = None          # JPEG bytes of the last photo
 SNAP_W, SNAP_H = 256, 192  # preview size, drawn 1:1 on the calculator
 PHOTO_DEFAULT = "Solve the question in this photo. Show full working."
-PHOTO_SIZES = (("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480))
+PHOTO_SIZES = (("SXGA", 1280, 1024), ("XGA", 1024, 768), ("SVGA", 800, 600), ("VGA", 640, 480))
+DOC_ENHANCE = True        # clean up photos for reading: even light, crisp text
+DOC_CELL = 32             # lighting is measured in 32x32 pixel cells
+DOC_PROMPT = ("This is a photo of a page, board or screen. First read ALL the text exactly, "
+              "including maths, and describe every diagram: shapes, labels, axes, arrows, values, "
+              "units. Then answer the request. If something is unreadable say which part. Request: ")
 PHOTO_MIRROR = True       # this camera's picture is mirrored left-to-right
 
 
@@ -1677,6 +1682,174 @@ def _pack4(grey: ptr8, out: ptr8, n: int, lo: int, span: int):
         k += 2
 
 
+@micropython.viper
+def _cells(raw: ptr8, w: int, h: int, cell: int, grid: ptr8, gw: int, gh: int):
+    """Mean brightness of each cell (16 samples), i.e. a tiny copy of the photo."""
+    st = cell >> 2
+    cy = 0
+    while cy < gh:
+        cx = 0
+        while cx < gw:
+            tot = 0
+            j = 0
+            while j < 4:
+                y = cy * cell + j * st + (st >> 1)
+                if y >= h:
+                    y = h - 1
+                i = 0
+                while i < 4:
+                    x = cx * cell + i * st + (st >> 1)
+                    if x >= w:
+                        x = w - 1
+                    tot += raw[y * w + x]
+                    i += 1
+                j += 1
+            grid[cy * gw + cx] = tot >> 4
+            cx += 1
+        cy += 1
+
+
+@micropython.viper
+def _paper(grid: ptr8, gw: int, gh: int, out: ptr8):
+    """Paper brightness per cell: the lightest of the 3x3 cells around it (ink
+    is dark, so the lightest neighbour is the paper, not the writing)."""
+    y = 0
+    while y < gh:
+        x = 0
+        while x < gw:
+            m = 0
+            dy = -1
+            while dy < 2:
+                yy = y + dy
+                if yy >= 0 and yy < gh:
+                    dx = -1
+                    while dx < 2:
+                        xx = x + dx
+                        if xx >= 0 and xx < gw:
+                            v = grid[yy * gw + xx]
+                            if v > m:
+                                m = v
+                        dx += 1
+                dy += 1
+            if m < 40:
+                m = 40
+            out[y * gw + x] = m
+            x += 1
+        y += 1
+
+
+@micropython.viper
+def _flatten(raw: ptr8, w: int, h: int, cell: int, paper: ptr8, gw: int, gh: int,
+             rowbg: ptr8, white: int):
+    """Divide out uneven lighting: paper -> white, ink stays dark. Paper
+    brightness is blended smoothly between cell centres."""
+    half = cell >> 1
+    y = 0
+    while y < h:
+        gy = y - half
+        if gy < 0:
+            gy = 0
+        iy = gy // cell
+        fy = ((gy - iy * cell) * 256) // cell
+        if iy >= gh - 1:
+            iy = gh - 1
+            fy = 0
+        i = 0
+        while i < gw:
+            a = int(paper[iy * gw + i])
+            b = a
+            if fy > 0:
+                b = int(paper[(iy + 1) * gw + i])
+            rowbg[i] = (a * (256 - fy) + b * fy) >> 8
+            i += 1
+        x = 0
+        base = y * w
+        while x < w:
+            gx = x - half
+            if gx < 0:
+                gx = 0
+            ix = gx // cell
+            fx = ((gx - ix * cell) * 256) // cell
+            if ix >= gw - 1:
+                ix = gw - 1
+                fx = 0
+            bg = int(rowbg[ix])
+            if fx > 0:
+                bg = (bg * (256 - fx) + int(rowbg[ix + 1]) * fx) >> 8
+            v = raw[base + x] * white // bg
+            if v > 255:
+                v = 255
+            raw[base + x] = v
+            x += 1
+        y += 1
+
+
+@micropython.viper
+def _sharpen(src: ptr8, dst: ptr8, w: int, h: int, d: int, amt: int):
+    """Unsharp mask: out = v + amt/8 * (4v - four neighbours d pixels away)."""
+    y = 0
+    while y < h:
+        base = y * w
+        x = 0
+        while x < w:
+            v = int(src[base + x])
+            if x >= d and x < w - d and y >= d and y < h - d:
+                s = int(src[base + x - d]) + int(src[base + x + d]) + int(src[base + x - d * w]) + int(src[base + x + d * w])
+                v = v + (amt * (4 * v - s)) // 8
+                if v < 0:
+                    v = 0
+                if v > 255:
+                    v = 255
+            dst[base + x] = v
+            x += 1
+        y += 1
+
+
+@micropython.viper
+def _apply_lut(buf: ptr8, n: int, lut: ptr8):
+    i = 0
+    while i < n:
+        buf[i] = lut[buf[i]]
+        i += 1
+
+
+def enhance_page(raw, w, h):
+    """Make a photo of a page easier to read (for people and for the AI):
+    1. even out the light (shadows, glare gradients), paper -> white
+    2. sharpen edges (mild focus blur, thin pen strokes)
+    3. stretch contrast so ink is properly black
+    Returns the new buffer (raw is reused/freed by the caller)."""
+    gw = (w + DOC_CELL - 1) // DOC_CELL
+    gh = (h + DOC_CELL - 1) // DOC_CELL
+    grid = bytearray(gw * gh)
+    paper = bytearray(gw * gh)
+    _cells(raw, w, h, DOC_CELL, grid, gw, gh)
+    _paper(grid, gw, gh, paper)
+    _flatten(raw, w, h, DOC_CELL, paper, gw, gh, bytearray(gw + 1), 238)
+    out = bytearray(w * h)
+    _sharpen(raw, out, w, h, 2, 6)
+    # contrast: darkest 1% -> black, paper stays white; a little extra bite
+    hist = [0] * 256
+    for k in range(0, w * h, 7):
+        hist[out[k]] += 1
+    n = sum(hist)
+    acc = 0
+    lo = 0
+    for v in range(256):
+        acc += hist[v]
+        if acc >= n // 100:
+            lo = v
+            break
+    hi = 235
+    span = max(40, hi - lo)
+    lut = bytearray(256)
+    for v in range(256):
+        t = (v - lo) * 255 // span
+        lut[v] = 0 if t < 0 else (255 if t > 255 else t)
+    _apply_lut(out, w * h, lut)
+    return out
+
+
 def _raw_photo():
     """(width, height, greyscale bytes) at the largest size that works. The
     camera is switched off again afterwards: left running it draws power."""
@@ -1728,6 +1901,13 @@ def take_snapshot():
     # (otherwise text reads backwards, for you and for the AI).
     if PHOTO_MIRROR:
         _mirror_rows(raw, w, h)
+    if DOC_ENHANCE:
+        try:
+            raw = enhance_page(raw, w, h)
+            gc.collect()
+        except Exception as e:      # out of memory etc: send the plain photo
+            print("enhance failed:", e)
+            gc.collect()
     # preview: average 4 samples per preview pixel, then stretch the contrast
     # (darkest 2% -> black, brightest 2% -> white) into 16 grey levels
     grey = bytearray(SNAP_W * SNAP_H)
@@ -1739,7 +1919,7 @@ def take_snapshot():
     _pack4(grey, out, SNAP_W * SNAP_H, lo, max(1, hi - lo))
     del grey
     try:
-        jpg = jpeg.Encoder(width=w, height=h, pixel_format="GRAY", quality=85).encode(raw)
+        jpg = jpeg.Encoder(width=w, height=h, pixel_format="GRAY", quality=82).encode(raw)
     except Exception as e:
         return "ERR:Could not compress the photo~" + str(e)[:80]
     del raw
@@ -1780,7 +1960,7 @@ def ask_snapshot(question):
     """GET_ASKSNAP: ask about the last photo; plain text reply like a question."""
     if last_photo() is None:
         return "error: Take a photo first (F6)."
-    q = question or PHOTO_DEFAULT
+    q = (DOC_PROMPT if DOC_ENHANCE else "") + (question or PHOTO_DEFAULT)
     deadline = time.ticks_add(time.ticks_ms(), PHOTO_BUDGET * 1000)
     why = ready_to_ask()
     if why:
