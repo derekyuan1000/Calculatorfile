@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13s"
+VERSION = "2026.11.13t"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -2418,6 +2418,20 @@ def _raw_photo():
 
 
 def take_snapshot():
+    """GET_SNAP: Bluetooth is switched off while the camera runs (the two
+    together restart the XIAO), then back on so the phone reconnects."""
+    bt = PHONE is not None
+    if bt:
+        phone_stop()
+        gc.collect()
+    try:
+        return _take_snapshot()
+    finally:
+        if bt:
+            phone_start()
+
+
+def _take_snapshot():
     """GET_SNAP: reply SNAP:256x192:<base64 of 4-bit greys> or ERR:..."""
     global LAST_SNAP
     if Camera is None:
