@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.14b"
+VERSION = "2026.11.14c"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -1984,6 +1984,24 @@ def _preview4(raw, w, h):
     return out
 
 
+HW_MIRRORED = False
+
+
+def _hw_mirror():
+    """Mirror the picture in the camera chip (OV5640 register 0x3821, bits
+    1-2) instead of flipping 786,000 pixels in Python (21 s!). Returns True
+    if it worked; the camera's default is mirrored, so the bits are flipped."""
+    try:
+        i2c = _af_i2c()
+        if (_rd(i2c, 0x300A), _rd(i2c, 0x300B)) != (0x56, 0x40):
+            return False
+        _wr(i2c, 0x3821, _rd(i2c, 0x3821) ^ 0x06)
+        return True
+    except Exception as e:
+        print("hardware mirror failed:", e)
+        return False
+
+
 def _tune_sensor(cam):
     """Let the camera chip do the clean-up in hardware: a bit more contrast
     and sharpness for text. Ignored on firmware without these settings."""
@@ -2113,6 +2131,8 @@ def _raw_photo():
         try:
             cam = Camera(pixel_format=PixelFormat.GRAYSCALE, frame_size=size)
             _tune_sensor(cam)
+            global HW_MIRRORED
+            HW_MIRRORED = PHOTO_MIRROR and _hw_mirror()
             time.sleep_ms(300)
             if CAM_AF:
                 cam.capture()         # get frames flowing
@@ -2177,8 +2197,8 @@ def _take_snapshot():
         return "ERR:Camera failed~" + str(e)[:90] + "~Is the camera board clicked on fully?"
     # This camera's image comes out mirrored left-to-right: flip each row
     # (otherwise text reads backwards, for you and for the AI).
-    if PHOTO_MIRROR:
-        _mirror(raw, w, h)
+    if PHOTO_MIRROR and not HW_MIRRORED:
+        _mirror(raw, w, h)          # slow fallback (~20 s); normally the chip does it
     out = _preview4(raw, w, h)
     gc.collect()
     try:
