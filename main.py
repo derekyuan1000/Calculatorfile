@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.13k"
+VERSION = "2026.11.13p"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -224,6 +224,9 @@ CURRENT = ""       # SSID we are connected to
 PENDING_SSID = ""  # set by SET_SSID, completed by SET_PASS
 BSSIDS = {}        # ssid -> router MAC from the last scan (skips the scan on wake)
 ASLEEP = False     # True while WiFi is switched off to save battery
+LINK = "auto"      # internet route: "auto" (WiFi, phone as backup), "wifi" or "phone"
+ROUTE = "wifi"     # route the current request is using
+WIFI_FAILED = False  # auto mode: WiFi already failed since waking -> use the phone
 LAST_USE = time.ticks_ms()
 HOLD_S = 0         # stay awake longer after a photo (you're deciding what to ask)
 
@@ -263,10 +266,12 @@ def _valid_net(n):
 
 
 def load_settings():
-    global MODEL, NETWORKS
+    global MODEL, NETWORKS, LINK
     d = _load_json(SETTINGS_FILE)
     if not isinstance(d, dict):
         d = {}
+    if d.get("link") in ("auto", "wifi", "phone"):
+        LINK = d["link"]
     m = d.get("model", d.get("cloud_model_hackclub", MODEL))
     MODEL = m if isinstance(m, str) and m else MODEL
     nets = d.get("networks", [])
@@ -278,7 +283,7 @@ def load_settings():
 
 
 def save_settings():
-    _save_json(SETTINGS_FILE, {"model": MODEL, "networks": NETWORKS})
+    _save_json(SETTINGS_FILE, {"model": MODEL, "networks": NETWORKS, "link": LINK})
 
 
 def known_index(ssid):
@@ -539,6 +544,11 @@ def wake_wifi():
 def recover_link():
     """Between tries of a failed request: rejoin if WiFi dropped; if it is
     still up but weak, look for a closer access point."""
+    if ROUTE == "phone":
+        if PHONE is not None and not PHONE.connected():
+            stage("Waiting for phone")
+            PHONE.wait(PHONE_WAIT_S)
+        return
     if not wlan.isconnected():
         stage("Rejoining WiFi")
         wake_wifi()
@@ -549,6 +559,8 @@ def recover_link():
 
 def weak_note():
     """Extra line for a network error message when the signal is the cause."""
+    if ROUTE == "phone":
+        return "~(via phone: is GI Link still open?)"
     r = rssi() if wlan.isconnected() else 0
     return "~WiFi signal here is weak (%d dBm)." % r if r and r < WEAK_DBM else ""
 
@@ -788,6 +800,281 @@ def remember_turn(question, answer):
     save_history()
 
 
+# ------------------------------------------------------------- phone link
+# The GI Link app on an Android phone can be the internet connection instead
+# of WiFi (useful on 5 GHz-only networks, or with no WiFi at all). The XIAO
+# talks to it over Bluetooth Low Energy (Nordic UART service) and the phone
+# makes the web requests for it:
+#   XIAO -> phone:  {"i":id,"m":"POST","u":url,"h":{headers},"n":len,"t":secs}\n + len bytes
+#   phone -> XIAO:  {"i":id,"s":status,"n":len,"h":{headers}}\n + len bytes
+#                or {"i":id,"e":"what went wrong"}\n
+# Settings > Connection on the calculator picks Auto / WiFi only / Phone only.
+try:
+    import bluetooth
+except ImportError:
+    bluetooth = None
+PHONE_NAME = "GI-calc"
+PHONE_WAIT_S = 8           # how long to wait for the app to (re)connect
+_NUS = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+_NUS_RX = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"   # phone writes here
+_NUS_TX = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"   # we notify here
+
+
+class PhoneLink:
+    def __init__(self):
+        self.ble = bluetooth.BLE()
+        self.ble.active(True)
+        try:
+            self.ble.config(gap_name=PHONE_NAME, mtu=517)
+        except Exception:
+            pass
+        self.ble.irq(self._irq)
+        rx = (bluetooth.UUID(_NUS_RX), bluetooth.FLAG_WRITE | bluetooth.FLAG_WRITE_NO_RESPONSE)
+        tx = (bluetooth.UUID(_NUS_TX), bluetooth.FLAG_NOTIFY | bluetooth.FLAG_READ)
+        ((self.tx, self.rx),) = self.ble.gatts_register_services(((bluetooth.UUID(_NUS), (tx, rx)),))
+        self.ble.gatts_set_buffer(self.rx, 8192, True)   # room for several 512-byte writes
+        self.conn = None
+        self.ready = False               # app subscribed and said hello
+        self.mtu = 23
+        self.inbuf = bytearray()
+        self.started = time.ticks_ms()
+        self.next_id = 1
+        self.advertise()
+
+    def advertise(self):
+        # flags + the service UUID (so the app finds us); name in the scan response
+        u = bytes(reversed(binascii.unhexlify(_NUS.replace("-", ""))))
+        adv = b"\x02\x01\x06" + bytes((len(u) + 1, 0x07)) + u
+        name = PHONE_NAME.encode()
+        resp = bytes((len(name) + 1, 0x09)) + name
+        try:
+            self.ble.gap_advertise(100000, adv_data=adv, resp_data=resp)
+        except Exception as e:
+            print("phone: advertise failed", e)
+
+    def _irq(self, event, data):
+        if event == 1:                     # phone connected (not ready until hello)
+            self.conn = data[0]
+            self.ready = False
+            self.inbuf = bytearray()
+        elif event == 2:                   # phone disconnected
+            self.conn = None
+            self.ready = False
+            self.mtu = 23
+            print("phone: disconnected")
+            self.advertise()
+        elif event == 3:                   # phone wrote data
+            if data[1] == self.rx:
+                self.inbuf += self.ble.gatts_read(self.rx)
+                if not self.ready and b"hello" in bytes(self.inbuf[:64]):
+                    # the app has turned on notifications: safe to send now
+                    self.ready = True
+                    self.inbuf = bytearray()
+                    print("phone: connected")
+        elif event == 21:                  # MTU agreed
+            self.mtu = data[1]
+
+    def connected(self):
+        return self.conn is not None and self.ready
+
+    def wait(self, secs):
+        end = time.ticks_add(time.ticks_ms(), int(secs * 1000))
+        while not self.connected() and time.ticks_diff(end, time.ticks_ms()) > 0:
+            time.sleep_ms(50)
+        return self.connected()
+
+    def send(self, data):
+        n = max(20, self.mtu - 3)
+        mv = memoryview(data)
+        k = 0
+        tries = 0
+        while k < len(data):
+            if self.conn is None:
+                raise OSError(128, "phone disconnected")
+            try:
+                self.ble.gatts_notify(self.conn, self.tx, mv[k:k + n])
+                k += n
+                tries = 0
+            except OSError:
+                tries += 1               # send queue full: give it a moment
+                if tries > 400:
+                    raise OSError(110, "phone not reading")
+                time.sleep_ms(5)
+
+    def request(self, method, url, headers, body, timeout):
+        """One web request through the phone. Returns (status, headers, body bytes)."""
+        if not self.connected():
+            raise OSError(128, "phone not connected")
+        rid = self.next_id
+        self.next_id += 1
+        body = body or b""
+        if isinstance(body, str):
+            body = body.encode()
+        head = json.dumps({"i": rid, "m": method, "u": url, "h": headers or {},
+                           "n": len(body), "t": int(timeout)})
+        self.inbuf = bytearray()
+        self.send(head.encode() + b"\n")
+        if body:
+            self.send(body)
+        del body
+        gc.collect()
+        end = time.ticks_add(time.ticks_ms(), int((timeout + 10) * 1000))
+        hdr = None
+        skip = 0                         # body bytes of a stale answer to drop
+        while True:
+            if self.conn is None:
+                raise OSError(128, "phone disconnected")
+            if time.ticks_diff(end, time.ticks_ms()) < 0:
+                raise OSError(110, "phone timed out")
+            if skip:
+                if len(self.inbuf) < skip:
+                    time.sleep_ms(10)
+                    continue
+                self.inbuf = self.inbuf[skip:]
+                skip = 0
+            if hdr is None:
+                j = bytes(self.inbuf[:1024]).find(b"\n")   # bytearray has no find()
+                if j >= 0:
+                    try:
+                        hdr = json.loads(bytes(self.inbuf[:j]))
+                    except ValueError:
+                        hdr = {}
+                    self.inbuf = self.inbuf[j + 1:]
+                    if hdr.get("i") != rid:
+                        skip = int(hdr.get("n", 0))   # stale answer to an older request
+                        hdr = None
+                        continue
+                    if "e" in hdr:
+                        raise OSError(-1, "phone: " + str(hdr["e"])[:40])
+            if hdr is not None and len(self.inbuf) >= int(hdr.get("n", 0)):
+                n = int(hdr.get("n", 0))
+                data = bytes(self.inbuf[:n])
+                self.inbuf = self.inbuf[n:]
+                return int(hdr.get("s", 0)), hdr.get("h") or {}, data
+            time.sleep_ms(10)
+
+
+PHONE = None
+
+
+def phone_start():
+    """Bluetooth on (if a phone route is allowed): the app reconnects by itself."""
+    global PHONE
+    if PHONE is not None or bluetooth is None or LINK == "wifi":
+        return
+    try:
+        PHONE = PhoneLink()
+        print("phone: Bluetooth on, waiting for GI Link")
+    except Exception as e:
+        print("phone: Bluetooth failed:", e)
+        PHONE = None
+
+
+def phone_stop():
+    global PHONE
+    if PHONE is not None:
+        try:
+            PHONE.ble.active(False)
+        except Exception:
+            pass
+        PHONE = None
+
+
+def phone_ready(wait=PHONE_WAIT_S):
+    """'' if the phone app is connected (waiting a moment for it), else why not."""
+    if bluetooth is None:
+        return "this XIAO firmware has no Bluetooth"
+    phone_start()
+    if PHONE is None:
+        return "Bluetooth failed to start"
+    if not PHONE.connected():
+        stage("Waiting for phone")
+        PHONE.wait(wait)
+    if not PHONE.connected():
+        return "phone not connected~Open GI Link on your phone (Bluetooth on)."
+    return ""
+
+
+class PhoneResp:
+    """Looks enough like a urequests response for the code below."""
+    def __init__(self, status, headers, data):
+        self.status_code = status
+        self.headers = headers
+        self.content = data
+        self.raw = None
+
+    @property
+    def text(self):
+        return self.content.decode()
+
+    def json(self):
+        return json.loads(self.content)
+
+    def close(self):
+        self.content = b""
+
+
+def http(method, url, headers=None, data=None, json_body=None, timeout=30):
+    """A web request over the route chosen by net_ready(): WiFi or the phone."""
+    if json_body is not None:
+        data = json.dumps(json_body)
+        headers = dict(headers or {})
+        headers.setdefault("Content-Type", "application/json")
+    if ROUTE == "phone" and PHONE is not None:
+        return PhoneResp(*PHONE.request(method, url, headers, data, timeout))
+    fn = urequests.post if method == "POST" else urequests.get
+
+    def go():
+        try:
+            return fn(url, headers=headers or {}, data=data, timeout=timeout)
+        except TypeError:
+            return fn(url, headers=headers or {}, data=data)
+    try:
+        return go()
+    except (OSError, MemoryError) as e:
+        # Bluetooth and WiFi share the chip's internal memory, and a secure
+        # connection needs a lot of it: if the phone isn't in use, switch
+        # Bluetooth off and try once more before giving up.
+        if PHONE is None or PHONE.connected():
+            raise
+        print("wifi request failed with Bluetooth on (%s): retrying without it" % e)
+        phone_stop()
+        gc.collect()
+        return go()
+
+
+def net_ready():
+    """Pick the route for the next request; '' if one works, else why not.
+    auto: WiFi first; if WiFi isn't there (once per wake), the phone."""
+    global ROUTE, WIFI_FAILED
+    if LINK == "phone":
+        ROUTE = "phone"
+        return phone_ready()
+    ROUTE = "wifi"
+    if LINK == "wifi" or bluetooth is None:
+        return wifi_ready()
+    if wlan.isconnected():
+        return ""
+    phone_start()
+    if NETWORKS and not WIFI_FAILED:
+        if PHONE is not None and PHONE.connected():
+            stage("Looking for WiFi")
+            ok, msg = auto_connect()        # quick: only a network that's in range
+            print("auto: wifi", msg)
+            if ok:
+                return ""
+        elif not wifi_ready():
+            return ""
+        WIFI_FAILED = True
+    why = phone_ready()
+    if not why:
+        ROUTE = "phone"
+        return ""
+    if not NETWORKS:
+        return "no WiFi saved and " + why
+    return "no WiFi here and " + why
+
+
 def hc_post(prompt, system, max_tokens, history=(), timeout=None, model=None):
     """POST to Hack Club AI. Returns the response object (caller closes it)."""
     gc.collect()  # keep as much RAM free as possible for the TLS handshake
@@ -797,19 +1084,10 @@ def hc_post(prompt, system, max_tokens, history=(), timeout=None, model=None):
     for role, text in history:
         messages.append({"role": role, "content": text})
     messages.append({"role": "user", "content": prompt})
-    kwargs = dict(
-        headers={
-            "Authorization": "Bearer " + HC_KEY,
-            "Content-Type": "application/json",
-        },
-        json={"model": model or MODEL, "messages": messages, "max_tokens": max_tokens},
-    )
     # A stalled connection must not freeze the XIAO: give up after API_TIMEOUT s.
-    # (Older urequests has no timeout argument, so fall back without it.)
-    try:
-        return urequests.post(HC_URL, timeout=timeout or API_TIMEOUT, **kwargs)
-    except TypeError:
-        return urequests.post(HC_URL, **kwargs)
+    return http("POST", HC_URL, {"Authorization": "Bearer " + HC_KEY},
+                json_body={"model": model or MODEL, "messages": messages, "max_tokens": max_tokens},
+                timeout=timeout or API_TIMEOUT)
 
 
 def left(deadline):
@@ -847,7 +1125,7 @@ def ready_to_ask():
     """'' if a question can go out now, else the reason it can't."""
     if not HC_KEY:
         return "no API key: copy .env to the XIAO~(mpremote connect COMx cp .env :.env)"
-    return wifi_ready()
+    return net_ready()
 
 
 def wifi_ready():
@@ -932,9 +1210,24 @@ def ask_ai(prompt, tries=3):
 
 
 def run_test():
-    """WiFi -> DNS -> a tiny real API call. Lines joined with ~."""
-    if not wlan.isconnected():
-        wake_wifi()
+    """WiFi (or phone) -> DNS -> a tiny real API call. Lines joined with ~."""
+    global ROUTE
+    why = net_ready()
+    if ROUTE == "phone":
+        lines = ["main.py " + VERSION, "Route: phone (GI Link)"]
+        if why:
+            return "ERR:" + "~".join(lines + [why])
+        t0 = time.ticks_ms()
+        try:
+            resp = hc_post("hi", None, 16)
+            code = resp.status_code
+            resp.close()
+        except Exception as e:
+            return "ERR:" + "~".join(lines + ["Phone request failed: " + str(e)[:40]])
+        secs = time.ticks_diff(time.ticks_ms(), t0) / 1000
+        if code == 200:
+            return "OK:" + "~".join(lines + ["Server ok, %.1fs" % secs])
+        return "ERR:" + "~".join(lines + ["Server: " + describe_status(code)])
     if not wlan.isconnected():
         return "ERR:WiFi: not connected~Check SSID and password, then use the WiFi row."
     lines = ["main.py " + VERSION]
@@ -2378,7 +2671,7 @@ def do_update():
                 "mpremote connect COMx cp .env :.env")
     if not UPDATE_URL.startswith("https://"):
         return "ERR:UPDATE_URL must start with https://"
-    why = wifi_ready()
+    why = net_ready()
     if why:
         return "ERR:" + why
     stage("Downloading update")
@@ -2387,10 +2680,7 @@ def do_update():
         headers["Authorization"] = "token " + UPDATE_TOKEN
     gc.collect()
     try:
-        try:
-            resp = urequests.get(UPDATE_URL, headers=headers, timeout=30)
-        except TypeError:
-            resp = urequests.get(UPDATE_URL, headers=headers)
+        resp = http("GET", UPDATE_URL, headers, timeout=60)
     except Exception as e:
         return "ERR:Download failed: " + net_error(e)
     done = False
@@ -2490,7 +2780,7 @@ def rollback():
 
 
 def handle_line(line):
-    global MODEL, CURRENT, PENDING_SSID
+    global MODEL, CURRENT, PENDING_SSID, LINK
     if line == "GET_UPDATE":
         try:
             return do_update()
@@ -2501,7 +2791,28 @@ def handle_line(line):
         # wifi field: 1 connected, S asleep (rejoins on the next question), 0 offline
         up = wlan.isconnected()
         state = "1" if up else ("S" if ASLEEP and CURRENT else "0")
-        return "OK:%s|%d|%s|%s" % (MODEL, len(NETWORKS), state, CURRENT if state != "0" else "")
+        name = CURRENT if state != "0" else ""
+        if not up and PHONE is not None and PHONE.connected() and LINK != "wifi":
+            state, name = "1", "Phone"
+        return "OK:%s|%d|%s|%s" % (MODEL, len(NETWORKS), state, name)
+    if line == "GET_LINK":
+        # mode|bluetooth available|phone connected now
+        return "OK:%s|%d|%d" % (LINK, bluetooth is not None,
+                                PHONE is not None and PHONE.connected())
+    if line.startswith("SET_LINK:"):
+        v = line[len("SET_LINK:"):].strip().lower()
+        if v not in ("auto", "wifi", "phone"):
+            return "ERR:Use auto, wifi or phone"
+        if v != "wifi" and bluetooth is None:
+            return "ERR:This XIAO firmware has no Bluetooth"
+        LINK = v
+        save_settings()
+        if v == "wifi":
+            phone_stop()
+        else:
+            phone_start()
+        return "OK:" + {"auto": "WiFi first, phone as backup",
+                        "wifi": "WiFi only", "phone": "Phone only"}[v]
     if line == "GET_NETS":
         try:
             return nets_reply()
@@ -2653,6 +2964,7 @@ def main():
         except Exception:
             pass
     LAST_USE = time.ticks_ms()
+    phone_start()     # phone app can reconnect while we wait for the question
     set_cpu(IDLE_HZ)  # full speed only once there is work to do
     print("listening for the calculator...")
     while True:
