@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.14i"
+VERSION = "2026.11.18b"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -582,6 +582,15 @@ def camera_standby():
             i2c = SoftI2C(scl=Pin(39, Pin.IN, Pin.PULL_UP), sda=Pin(40, Pin.IN, Pin.PULL_UP), freq=100000)
             found = i2c.scan()
             if 0x3C in found:    # OV5640 / OV3660: 16-bit register addresses
+                # Park the autofocus lens first: holding it away from rest
+                # keeps current flowing through its coil, standby or not.
+                try:
+                    r = i2c.readfrom_mem(0x3C, 0x3602, 1, addrsize=16)[0]
+                    i2c.writeto_mem(0x3C, 0x3602, bytes([r & 0x0F]), addrsize=16)
+                    r = i2c.readfrom_mem(0x3C, 0x3603, 1, addrsize=16)[0]
+                    i2c.writeto_mem(0x3C, 0x3603, bytes([r & 0xC0]), addrsize=16)
+                except Exception:
+                    pass
                 i2c.writeto_mem(0x3C, 0x3008, b"\x42", addrsize=16)
                 print("camera: standby (OV5640)")
             elif 0x30 in found:  # OV2640
@@ -611,6 +620,20 @@ def _rtc_put(d):
         machine.RTC().memory(json.dumps(d).encode())
     except Exception as e:
         print("rtc save failed:", e)
+
+
+def last_route(r=None):
+    """Route the last Auto question used ('wifi' or 'phone'), kept across deep
+    sleep: if it was the phone, Bluetooth starts as soon as GI calls."""
+    d = _rtc_get()
+    if r is not None and d.get("rt") != r:
+        d["rt"] = r
+        _rtc_put(d)
+    return d.get("rt", "wifi")
+
+
+def bt_early():
+    return LINK == "phone" or (LINK == "auto" and last_route() == "phone")
 
 
 def save_rtc():
@@ -815,7 +838,8 @@ try:
 except ImportError:
     bluetooth = None
 PHONE_NAME = "GI-calc"
-PHONE_WAIT_S = 8           # how long to wait for the app to (re)connect
+PHONE_WAIT_S = 20          # how long to wait for the app to (re)connect (a phone
+                           # with its screen off only scans every few seconds)
 _NUS = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 _NUS_RX = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"   # phone writes here
 _NUS_TX = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"   # we notify here
@@ -1075,6 +1099,7 @@ def net_ready():
     if LINK == "wifi" or bluetooth is None:
         return wifi_ready()
     if wlan.isconnected():
+        last_route("wifi")
         return ""
     phone_start()
     if NETWORKS and not WIFI_FAILED:
@@ -1083,13 +1108,16 @@ def net_ready():
             ok, msg = auto_connect()        # quick: only a network that's in range
             print("auto: wifi", msg)
             if ok:
+                last_route("wifi")
                 return ""
         elif not wifi_ready():
+            last_route("wifi")
             return ""
         WIFI_FAILED = True
     why = phone_ready()
     if not why:
         ROUTE = "phone"
+        last_route("phone")
         return ""
     if not NETWORKS:
         return "no WiFi saved and " + why
@@ -2098,6 +2126,16 @@ def autofocus(cam, w, h):
             return scores[pos]
 
         last = FOCUS_POS
+        if 0 <= last <= 1023:
+            # Quick check: if the last spot is still the sharpest (you're
+            # holding the calculator about the same distance away), stop.
+            a, b, c = score(last - 40), score(last), score(last + 40)
+            if b > 1.05 * max(a, c) and b > 0:
+                _lens(i2c, last)
+                time.sleep_ms(30)
+                AF_NOTE = "lens %d (same as last), %d tries, %.1fs" % (
+                    last, len(scores), time.ticks_diff(time.ticks_ms(), t0) / 1000)
+                return AF_NOTE
         for pos in ((last - 150, last, last + 150) if 0 <= last <= 1023 else
                     (0, 200, 400, 600, 800, 1000)):
             score(pos)
@@ -2161,6 +2199,7 @@ def _raw_photo():
             HW_MIRRORED = PHOTO_MIRROR and _hw_mirror()
             time.sleep_ms(300)
             if CAM_AF:
+                stage("Focusing - hold still")
                 cam.capture()         # get frames flowing
                 print("autofocus:", autofocus(cam, w, h))
             # sharpening only now: switched on during focusing it amplifies
@@ -2171,6 +2210,7 @@ def _raw_photo():
                 img = cam.capture()
                 if img is not None and len(img) >= w * h and i >= 2:
                     raw = bytearray(img)
+                    stage("Got it - you can move")
                     break
                 time.sleep_ms(100)
             if raw:
@@ -2228,6 +2268,7 @@ def _take_snapshot():
     # (otherwise text reads backwards, for you and for the AI).
     if PHOTO_MIRROR and not HW_MIRRORED:
         _mirror(raw, w, h)          # slow fallback (~20 s); normally the chip does it
+    stage("Preparing the photo")
     out = _preview4(raw, w, h)
     gc.collect()
     try:
@@ -2745,7 +2786,12 @@ def main():
         except Exception:
             pass
     LAST_USE = time.ticks_ms()
-    phone_start()     # phone app can reconnect while we wait for the question
+    # Bluetooth costs power the whole time the XIAO is awake, so only "Phone
+    # only" starts it straight away, and only once the calculator has really
+    # called (not on a noisy-line wake). In Auto it starts when a question
+    # finds no WiFi (net_ready).
+    if synced and bt_early():
+        phone_start()
     set_cpu(IDLE_HZ)  # full speed only once there is work to do
     print("listening for the calculator...")
     while True:
@@ -2780,6 +2826,8 @@ def main():
             ack()
             if not synced:
                 false_wakes(0)
+                if bt_early():
+                    phone_start()
             synced = True
             idle_limit = IDLE_OFF_S
             HOLD_S = 180 if text == "GET_SNAP" else 0
