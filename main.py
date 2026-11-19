@@ -119,7 +119,7 @@ HC_KEY = _ENV.get("HC_KEY", HC_KEY)
 UPDATE_URL = _ENV.get("UPDATE_URL", "")
 UPDATE_TOKEN = _ENV.get("UPDATE_TOKEN", "")
 UPDATE_MAX = 400000   # bytes: refuse anything bigger
-VERSION = "2026.11.18b"
+VERSION = "2026.11.19a"
 WIFI_SSID = _ENV.get("WIFI_SSID", WIFI_SSID)
 WIFI_PASSWORD = _ENV.get("WIFI_PASSWORD", WIFI_PASSWORD)
 BAUD = 115200       # calculator link; matches GI.g3a
@@ -167,7 +167,12 @@ SYSTEM_PROMPT = (
     "3. NEVER use markdown, LaTeX, tables, bullets, asterisks for bold, "
     "backticks, hash headings or dollar signs.\n"
     "4. Put each separate item on its own short line (about 30 characters "
-    "or fewer where possible). Do not use the tilde character.\n\n"
+    "or fewer where possible). Do not use the tilde character.\n"
+    "5. The calculator draws maths properly from this plain form: x^2 as a "
+    "power, a/b as a stacked fraction, sqrt(x) and cbrt(x) as roots, pi as "
+    "the pi sign, * as a times sign. So put brackets round any top, bottom "
+    "or power with more than one term: (x+1)/(x-1), e^(2x), x^(n+1). Write "
+    "<= >= != +- for inequalities and plus-or-minus.\n\n"
     "Keep every answer as short as possible: no preamble, no restating the "
     "question, no filler, no caveats unless essential. One short sentence or "
     "phrase is ideal for ordinary questions.\n\n"
@@ -192,7 +197,55 @@ _ASCII_MAP = {
 }
 
 
+_TEX = (("\\rightarrow", "->"), ("\\left", ""), ("\\right", ""), ("\\cdot", "*"), ("\\times", "*"),
+        ("\\div", "/"), ("\\pi", "pi"), ("\\theta", "theta"), ("\\infty", "infinity"),
+        ("\\leq", "<="), ("\\geq", ">="), ("\\le", "<="), ("\\ge", ">="),
+        ("\\neq", "!="), ("\\ne", "!="), ("\\pm", "+-"), ("\\to", "->"),
+        ("\\approx", "="), ("\\,", " "), ("\\;", " "),
+        ("\\(", ""), ("\\)", ""), ("\\[", ""), ("\\]", ""), ("\\dfrac", "\\frac"))
+
+
+def _brace(s, i):
+    """s[i] == '{': index of the matching '}' (or -1)."""
+    d = 0
+    for j in range(i, len(s)):
+        if s[j] == "{":
+            d += 1
+        elif s[j] == "}":
+            d -= 1
+            if d == 0:
+                return j
+    return -1
+
+
+def from_tex(s):
+    """LaTeX the model slipped in anyway -> the plain form the calculator
+    draws: \\frac{a}{b} -> (a)/(b), \\sqrt{x} -> sqrt(x), x^{n+1} -> x^(n+1)."""
+    if "\\" not in s and "^{" not in s:
+        return s
+    for a, b in _TEX:
+        s = s.replace(a, b)
+    for name, fmt in (("\\frac", 2), ("\\sqrt", 1)):
+        guard = 0
+        while name + "{" in s and guard < 50:
+            guard += 1
+            i = s.find(name + "{")
+            j = _brace(s, i + len(name))
+            if j < 0:
+                break
+            first = s[i + len(name) + 1:j]
+            if fmt == 2 and j + 1 < len(s) and s[j + 1] == "{":
+                k = _brace(s, j + 1)
+                if k < 0:
+                    break
+                s = s[:i] + "(" + first + ")/(" + s[j + 2:k] + ")" + s[k + 1:]
+            else:
+                s = s[:i] + "sqrt(" + first + ")" + s[j + 1:]
+    return s.replace("^{", "^(").replace("_{", "_(").replace("{", "(").replace("}", ")").replace("\\", "")
+
+
 def to_ascii(text):
+    text = from_tex(text)
     out = []
     for ch in text:
         if ch == "\n" or 32 <= ord(ch) < 127:
@@ -915,6 +968,20 @@ class PhoneLink:
     def connected(self):
         return self.conn is not None and self.ready
 
+    def take_question(self):
+        """A question typed in GI Link: {"q": "..."} on its own line."""
+        self._pull()
+        j = bytes(self.inbuf[:1024]).find(b"\n")
+        if j < 0:
+            return None
+        line = bytes(self.inbuf[:j])
+        self.inbuf = self.inbuf[j + 1:]
+        try:
+            q = json.loads(line).get("q")
+        except (ValueError, AttributeError):
+            return None
+        return q if isinstance(q, str) and q.strip() else None
+
     def wait(self, secs):
         end = time.ticks_add(time.ticks_ms(), int(secs * 1000))
         while not self.connected() and time.ticks_diff(end, time.ticks_ms()) > 0:
@@ -1013,6 +1080,51 @@ def phone_start():
     except Exception as e:
         print("phone: Bluetooth failed:", e)
         PHONE = None
+
+
+PHONEQ_WAIT_S = 170         # GI waits 180 s for GET_PHONEQ
+
+
+def phone_question():
+    """DOWN on GI: wait for a question typed in GI Link, then hand it to GI,
+    which asks it the usual way. Q:<text>, or a message to show."""
+    if LINK == "wifi":
+        return "ERR:Typing on the phone needs Settings > Connection set to Auto or Phone only."
+    if bluetooth is None:
+        return "ERR:This XIAO firmware has no Bluetooth"
+    phone_start()
+    if PHONE is None:
+        return "ERR:Bluetooth would not start"
+    stage("Open GI Link on your phone")
+    told = False
+    end = time.ticks_add(time.ticks_ms(), PHONEQ_WAIT_S * 1000)
+    while time.ticks_diff(end, time.ticks_ms()) > 0:
+        if uart.any():                 # GI gave up (EXIT): stop waiting
+            return "ERR:cancelled"
+        if PHONE.connected():
+            if not told:
+                try:
+                    PHONE.send(b'{"w":1}\n')
+                except OSError:
+                    pass
+                stage("Type your question in GI Link")
+                told = True
+            q = PHONE.take_question()
+            if q:
+                q = to_ascii(q).replace("~", "-").replace("\n", " ").strip()
+                last_route("phone")
+                touch()
+                return "Q:" + q[:250]
+        elif told:
+            told = False
+            stage("Phone disconnected: open GI Link")
+        time.sleep_ms(50)
+    try:
+        if PHONE.connected():
+            PHONE.send(b'{"w":0}\n')
+    except OSError:
+        pass
+    return "ERR:No question came from the phone. Press DOWN to try again."
 
 
 def phone_stop():
@@ -2617,6 +2729,9 @@ def handle_line(line):
         if not up and PHONE is not None and PHONE.connected() and LINK != "wifi":
             state, name = "1", "Phone"
         return "OK:%s|%d|%s|%s" % (MODEL, len(NETWORKS), state, name)
+    if line == "GET_PHONEQ":
+        return phone_question()
+
     if line == "GET_LINK":
         # mode|bluetooth available|phone connected now
         return "OK:%s|%d|%d" % (LINK, bluetooth is not None,
